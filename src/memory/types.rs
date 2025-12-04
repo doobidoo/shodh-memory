@@ -365,36 +365,38 @@ pub struct Experience {
     // =========================================================================
     // ROBOTICS FIELDS (optional, backward compatible)
     // =========================================================================
+    // NOTE: skip_serializing_if REMOVED - breaks bincode binary format
+    // Binary formats like bincode are positional and require all fields to be present
     /// Robot/drone identifier for multi-agent systems
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub robot_id: Option<String>,
 
     /// Mission identifier this experience belongs to
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub mission_id: Option<String>,
 
     /// GPS coordinates (latitude, longitude, altitude)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub geo_location: Option<[f64; 3]>,
 
     /// Local coordinates (x, y, z in meters)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub local_position: Option<[f32; 3]>,
 
     /// Heading in degrees (0-360)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub heading: Option<f32>,
 
     /// Action that was performed (for action-outcome learning)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub action_type: Option<String>,
 
     /// Reward signal for reinforcement learning (-1.0 to 1.0)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub reward: Option<f32>,
 
     /// Sensor readings at time of experience
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
     pub sensor_data: HashMap<String, f64>,
 
     // =========================================================================
@@ -402,49 +404,49 @@ pub struct Experience {
     // =========================================================================
     /// Decision context: What state/conditions led to this decision?
     /// E.g., "battery_low=true, obstacle_ahead=true, weather=windy"
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub decision_context: Option<HashMap<String, String>>,
 
     /// Action parameters: Specific parameters of the action taken
     /// E.g., {"speed": "0.5", "turn_angle": "45", "altitude_change": "-10"}
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub action_params: Option<HashMap<String, String>>,
 
     /// Outcome type: success, failure, partial, aborted, timeout
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub outcome_type: Option<String>,
 
     /// Outcome details: What specifically happened?
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub outcome_details: Option<String>,
 
     /// Confidence score for this decision (0.0-1.0)
     /// How confident was the system when making this decision?
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub confidence: Option<f32>,
 
     /// Alternative actions considered but not taken
     /// For learning "what else could have been done"
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub alternatives_considered: Vec<String>,
 
     // =========================================================================
     // ENVIRONMENTAL CONTEXT
     // =========================================================================
     /// Weather conditions: {"wind_speed": "15", "visibility": "good", "precipitation": "none"}
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub weather: Option<HashMap<String, String>>,
 
     /// Terrain type: indoor, outdoor, urban, rural, water, aerial
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub terrain_type: Option<String>,
 
     /// Lighting conditions: bright, dim, dark, variable
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub lighting: Option<String>,
 
     /// Other agents detected: [{"id": "drone_002", "distance": "50m", "type": "friendly"}]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub nearby_agents: Vec<HashMap<String, String>>,
 
     // =========================================================================
@@ -459,34 +461,34 @@ pub struct Experience {
     pub is_anomaly: bool,
 
     /// Severity level: info, warning, error, critical
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub severity: Option<String>,
 
     /// Recovery action taken (if this was a failure)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub recovery_action: Option<String>,
 
     /// Root cause (if known)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub root_cause: Option<String>,
 
     // =========================================================================
     // LEARNED PATTERNS & PREDICTIONS
     // =========================================================================
     /// Pattern ID this experience matches (if recognized)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub pattern_id: Option<String>,
 
     /// Predicted outcome before action was taken
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub predicted_outcome: Option<String>,
 
     /// Was the prediction correct?
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub prediction_accurate: Option<bool>,
 
     /// Tags for quick filtering: ["obstacle", "battery", "navigation", "emergency"]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 
@@ -646,29 +648,46 @@ impl Memory {
 }
 
 // Custom serialization for Memory to flatten the Arc<Mutex<>> field
+/// Flat representation for serialization - MUST match exact field order for binary formats
+/// This struct ensures symmetric serialize/deserialize with bincode
+#[derive(Serialize, Deserialize)]
+struct MemoryFlat {
+    id: MemoryId,
+    experience: Experience,
+    importance: f32,
+    access_count: u32,
+    created_at: DateTime<Utc>,
+    last_accessed: DateTime<Utc>,
+    compressed: bool,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    actor_id: Option<String>,
+    temporal_relevance: f32,
+    score: Option<f32>,
+}
+
 impl Serialize for Memory {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        use serde::ser::SerializeStruct;
-
         let meta = self.metadata.lock();
-        // Always serialize all 12 fields for binary format consistency
-        let mut state = serializer.serialize_struct("Memory", 12)?;
-        state.serialize_field("memory_id", &self.id)?;
-        state.serialize_field("experience", &self.experience)?;
-        state.serialize_field("importance", &meta.importance)?;
-        state.serialize_field("access_count", &meta.access_count)?;
-        state.serialize_field("created_at", &self.created_at)?;
-        state.serialize_field("last_accessed", &meta.last_accessed)?;
-        state.serialize_field("compressed", &self.compressed)?;
-        state.serialize_field("agent_id", &self.agent_id)?;
-        state.serialize_field("run_id", &self.run_id)?;
-        state.serialize_field("actor_id", &self.actor_id)?;
-        state.serialize_field("temporal_relevance", &meta.temporal_relevance)?;
-        state.serialize_field("score", &self.score)?; // Always serialize, Option handles None
-        state.end()
+        // Convert to flat struct for consistent binary serialization
+        let flat = MemoryFlat {
+            id: self.id.clone(),
+            experience: self.experience.clone(),
+            importance: meta.importance,
+            access_count: meta.access_count,
+            created_at: self.created_at,
+            last_accessed: meta.last_accessed,
+            compressed: self.compressed,
+            agent_id: self.agent_id.clone(),
+            run_id: self.run_id.clone(),
+            actor_id: self.actor_id.clone(),
+            temporal_relevance: meta.temporal_relevance,
+            score: self.score,
+        };
+        flat.serialize(serializer)
     }
 }
 
@@ -678,23 +697,6 @@ impl<'de> Deserialize<'de> for Memory {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct MemoryFlat {
-            #[serde(rename = "memory_id")]
-            id: MemoryId,
-            experience: Experience,
-            importance: f32,
-            access_count: u32,
-            created_at: DateTime<Utc>,
-            last_accessed: DateTime<Utc>,
-            compressed: bool,
-            agent_id: Option<String>,
-            run_id: Option<String>,
-            actor_id: Option<String>,
-            temporal_relevance: f32,
-            score: Option<f32>,
-        }
-
         let flat = MemoryFlat::deserialize(deserializer)?;
         Ok(Memory {
             id: flat.id,
@@ -1210,6 +1212,7 @@ pub struct MemoryStats {
     pub working_memory_count: usize,
     pub session_memory_count: usize,
     pub long_term_memory_count: usize,
+    pub vector_index_count: usize,
     pub compressed_count: usize,
     pub promotions_to_session: usize,
     pub promotions_to_longterm: usize,

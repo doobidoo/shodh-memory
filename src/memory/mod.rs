@@ -126,6 +126,18 @@ impl MemorySystem {
         // Disable visualization logging for production performance
         let logger = Arc::new(RwLock::new(MemoryLogger::new(false)));
 
+        // Load stats from storage to recover state after restart
+        let initial_stats = {
+            let storage_stats = storage.get_stats().unwrap_or_default();
+            let vector_count = retriever.len();
+            MemoryStats {
+                total_memories: storage_stats.total_count,
+                long_term_memory_count: storage_stats.total_count,
+                vector_index_count: vector_count,
+                ..Default::default()
+            }
+        };
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -138,7 +150,7 @@ impl MemorySystem {
             embedder,
             query_cache: Arc::new(DashMap::new()),
             content_cache: Arc::new(DashMap::new()),
-            stats: Arc::new(RwLock::new(MemoryStats::default())),
+            stats: Arc::new(RwLock::new(initial_stats)),
             logger,
         })
     }
@@ -376,40 +388,57 @@ impl MemorySystem {
             .search_ids(&vector_query, query.max_results)?;
 
         // Fetch memories with cache-aware strategy
+        // CRITICAL: Apply filters after fetching to ensure mission_id, robot_id etc. are respected
         let mut memories = Vec::new();
         let mut sources = Vec::new();
         let mut cache_hits = 0;
         let mut storage_fetches = 0;
+        let mut filtered_out = 0;
 
         for (memory_id, _score) in memory_ids {
             // Try working memory first (hot cache, zero-copy Arc clone)
             if let Some(memory) = self.working_memory.read().get(&memory_id) {
-                memories.push(memory); // Already cloned by get()
-                if !sources.contains(&"working") {
-                    sources.push("working");
+                // CRITICAL FIX: Apply filters before adding to results
+                if self.retriever.matches_filters(&memory, &vector_query) {
+                    memories.push(memory);
+                    if !sources.contains(&"working") {
+                        sources.push("working");
+                    }
+                    cache_hits += 1;
+                } else {
+                    filtered_out += 1;
                 }
-                cache_hits += 1;
                 continue;
             }
 
             // Try session memory second (warm cache, zero-copy Arc clone)
             if let Some(memory) = self.session_memory.read().get(&memory_id) {
-                memories.push(memory); // Already cloned by get()
-                if !sources.contains(&"session") {
-                    sources.push("session");
+                // CRITICAL FIX: Apply filters before adding to results
+                if self.retriever.matches_filters(&memory, &vector_query) {
+                    memories.push(memory);
+                    if !sources.contains(&"session") {
+                        sources.push("session");
+                    }
+                    cache_hits += 1;
+                } else {
+                    filtered_out += 1;
                 }
-                cache_hits += 1;
                 continue;
             }
 
             // Cold path: Fetch from RocksDB storage (expensive deserialization)
             match self.retriever.get_from_storage(&memory_id) {
                 Ok(memory) => {
-                    memories.push(Arc::new(memory));
-                    if !sources.contains(&"longterm") {
-                        sources.push("longterm");
+                    // CRITICAL FIX: Apply filters before adding to results
+                    if self.retriever.matches_filters(&memory, &vector_query) {
+                        memories.push(Arc::new(memory));
+                        if !sources.contains(&"longterm") {
+                            sources.push("longterm");
+                        }
+                        storage_fetches += 1;
+                    } else {
+                        filtered_out += 1;
                     }
-                    storage_fetches += 1;
                 }
                 Err(e) => {
                     tracing::warn!(memory_id = %memory_id.0, error = %e, "Failed to fetch from storage");
@@ -420,6 +449,8 @@ impl MemorySystem {
                 break;
             }
         }
+
+        tracing::debug!(filtered_out = filtered_out, "Filter pass completed");
 
         // Log cache efficiency
         tracing::debug!(
@@ -957,7 +988,13 @@ impl MemorySystem {
 
     /// Flush long-term storage to ensure data persistence (critical for graceful shutdown)
     pub fn flush_storage(&self) -> Result<()> {
-        self.long_term_memory.flush()
+        // Flush RocksDB storage
+        self.long_term_memory.flush()?;
+
+        // Persist vector index and ID mapping for restart recovery
+        self.retriever.save()?;
+
+        Ok(())
     }
 
     /// Advanced search using storage criteria

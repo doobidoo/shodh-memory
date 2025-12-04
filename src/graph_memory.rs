@@ -132,7 +132,6 @@ pub struct RelationshipEdge {
     pub context: String,
 
     // === Hebbian Synaptic Plasticity Fields ===
-
     /// When this synapse was last activated (used in retrieval/traversal)
     /// Used to calculate time-based decay
     #[serde(default = "default_last_activated")]
@@ -154,11 +153,11 @@ fn default_last_activated() -> DateTime<Utc> {
 }
 
 /// Hebbian learning constants
-const LEARNING_RATE: f32 = 0.1;           // η: How much strength increases per co-activation
-const DECAY_HALF_LIFE_DAYS: f64 = 14.0;   // λ: Strength halves every 14 days without use
-const LTP_THRESHOLD: u32 = 10;            // Activations needed for Long-Term Potentiation
-const LTP_DECAY_FACTOR: f32 = 0.1;        // Potentiated synapses decay 10x slower
-const MIN_STRENGTH: f32 = 0.01;           // Floor to prevent complete forgetting
+const LEARNING_RATE: f32 = 0.1; // η: How much strength increases per co-activation
+const DECAY_HALF_LIFE_DAYS: f64 = 14.0; // λ: Strength halves every 14 days without use
+const LTP_THRESHOLD: u32 = 10; // Activations needed for Long-Term Potentiation
+const LTP_DECAY_FACTOR: f32 = 0.1; // Potentiated synapses decay 10x slower
+const MIN_STRENGTH: f32 = 0.01; // Floor to prevent complete forgetting
 
 impl RelationshipEdge {
     /// Strengthen this synapse (Hebbian learning)
@@ -200,7 +199,7 @@ impl RelationshipEdge {
         }
 
         // Calculate decay rate (λ = ln(2) / half_life)
-        let lambda = 0.693147 / DECAY_HALF_LIFE_DAYS;
+        let lambda = std::f64::consts::LN_2 / DECAY_HALF_LIFE_DAYS;
 
         // Potentiated synapses decay much slower (biological LTP)
         let effective_lambda = if self.potentiated {
@@ -236,7 +235,7 @@ impl RelationshipEdge {
             return self.strength;
         }
 
-        let lambda = 0.693147 / DECAY_HALF_LIFE_DAYS;
+        let lambda = std::f64::consts::LN_2 / DECAY_HALF_LIFE_DAYS;
         let effective_lambda = if self.potentiated {
             lambda * LTP_DECAY_FACTOR as f64
         } else {
