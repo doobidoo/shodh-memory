@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="120" alt="Shodh-Memory">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Shodh-Memory">
 </p>
 
 <h1 align="center">Shodh-Memory</h1>
