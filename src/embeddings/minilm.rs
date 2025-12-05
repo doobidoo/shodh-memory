@@ -183,9 +183,7 @@ impl MiniLMEmbedder {
     /// mitigating the thread-safety issue with std::env::set_var.
     fn ensure_onnx_runtime_available(offline_mode: bool) -> Result<()> {
         // Use OnceLock to ensure we only initialize once (thread-safe)
-        let result = ORT_PATH_INIT.get_or_init(|| {
-            Self::init_ort_path_inner(offline_mode)
-        });
+        let result = ORT_PATH_INIT.get_or_init(|| Self::init_ort_path_inner(offline_mode));
 
         match result {
             Ok(_) => Ok(()),
@@ -225,8 +223,8 @@ impl MiniLMEmbedder {
         }
 
         tracing::info!("ONNX Runtime not found. Downloading...");
-        let onnx_path = super::downloader::download_onnx_runtime(None)
-            .map_err(|e| e.to_string())?;
+        let onnx_path =
+            super::downloader::download_onnx_runtime(None).map_err(|e| e.to_string())?;
         tracing::info!(
             "Setting ORT_DYLIB_PATH to downloaded runtime: {:?}",
             onnx_path

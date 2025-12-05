@@ -393,11 +393,16 @@ impl VamanaIndex {
                 .ok_or_else(|| anyhow!("Vector {id} not found"))?
                 .clone()),
             VectorStorage::Mmap {
-                mmap, dimension, num_vectors,
+                mmap,
+                dimension,
+                num_vectors,
             } => {
                 // Bounds check
                 if id as usize >= *num_vectors {
-                    return Err(anyhow!("Vector {id} out of bounds (num_vectors={})", num_vectors));
+                    return Err(anyhow!(
+                        "Vector {id} out of bounds (num_vectors={})",
+                        num_vectors
+                    ));
                 }
 
                 let start = id as usize * dimension;
@@ -418,7 +423,9 @@ impl VamanaIndex {
                 debug_assert!(
                     end <= total_floats,
                     "Vector slice bounds [{}..{}] exceed mmap capacity ({})",
-                    start, end, total_floats
+                    start,
+                    end,
+                    total_floats
                 );
 
                 // SAFETY: from_raw_parts is safe because:
@@ -426,12 +433,8 @@ impl VamanaIndex {
                 // 2. Bounds verified: end <= total_floats
                 // 3. Mmap is valid for the lifetime of the returned slice
                 // 4. f32 is Copy, no ownership issues
-                let float_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        ptr as *const f32,
-                        total_floats,
-                    )
-                };
+                let float_slice =
+                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
 
                 Ok(float_slice[start..end].to_vec())
             }
@@ -465,7 +468,10 @@ impl VamanaIndex {
         // Greedy search
         while let Some(Reverse(current)) = candidates.pop() {
             // Defensive check: w should never be empty (entry point pushed above)
-            if w.peek().map(|p| current.distance > p.distance).unwrap_or(false) {
+            if w.peek()
+                .map(|p| current.distance > p.distance)
+                .unwrap_or(false)
+            {
                 break;
             }
 
@@ -724,9 +730,8 @@ impl VamanaIndex {
                 // Read vectors from mmap with alignment-safe approach
                 let mut vecs = Vec::with_capacity(*num_vectors);
                 let total_floats = mmap.len() / std::mem::size_of::<f32>();
-                let float_slice = unsafe {
-                    std::slice::from_raw_parts(ptr as *const f32, total_floats)
-                };
+                let float_slice =
+                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
 
                 for i in 0..*num_vectors {
                     let start = i * dimension;
@@ -734,7 +739,10 @@ impl VamanaIndex {
                     debug_assert!(
                         end <= total_floats,
                         "Vector {} bounds [{}..{}] exceed mmap capacity ({})",
-                        i, start, end, total_floats
+                        i,
+                        start,
+                        end,
+                        total_floats
                     );
                     vecs.push(float_slice[start..end].to_vec());
                 }

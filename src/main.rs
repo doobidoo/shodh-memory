@@ -65,14 +65,14 @@ pub struct AuditEvent {
 /// SSE Memory Event - lightweight event for real-time streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEvent {
-    pub event_type: String,           // CREATE, RETRIEVE, DELETE, GRAPH_UPDATE
+    pub event_type: String, // CREATE, RETRIEVE, DELETE, GRAPH_UPDATE
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub user_id: String,
     pub memory_id: Option<String>,
     pub content_preview: Option<String>, // First 100 chars
     pub experience_type: Option<String>,
     pub importance: Option<f32>,
-    pub count: Option<usize>,         // For retrieve events - number of results
+    pub count: Option<usize>, // For retrieve events - number of results
 }
 
 // Note: Audit and memory configuration is now in config.rs and loaded via ServerConfig
@@ -511,10 +511,7 @@ impl MultiUserMemoryManager {
             }
         }
 
-        info!(
-            "✅ Flushed 1 audit database and {} user databases",
-            flushed
-        );
+        info!("✅ Flushed 1 audit database and {} user databases", flushed);
 
         // Give RocksDB a moment to complete background tasks
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -852,7 +849,9 @@ struct RecallRequest {
     limit: usize,
 }
 
-fn default_recall_limit() -> usize { 5 }
+fn default_recall_limit() -> usize {
+    5
+}
 
 /// Simplified recall response - returns just text snippets
 #[derive(Debug, Serialize)]
@@ -1007,7 +1006,9 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, Statu
 /// No authentication required - read-only, lightweight event stream
 async fn memory_events_sse(
     State(state): State<AppState>,
-) -> axum::response::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
+) -> axum::response::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     use axum::response::sse::Event;
     use futures::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
@@ -1019,20 +1020,17 @@ async fn memory_events_sse(
         match result {
             Ok(event) => {
                 let json = serde_json::to_string(&event).ok()?;
-                Some(Ok(Event::default()
-                    .event(&event.event_type)
-                    .data(json)))
+                Some(Ok(Event::default().event(&event.event_type).data(json)))
             }
             Err(_) => None, // Lagged receiver, skip event
         }
     });
 
-    axum::response::Sse::new(event_stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(std::time::Duration::from_secs(15))
-                .text("heartbeat")
-        )
+    axum::response::Sse::new(event_stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("heartbeat"),
+    )
 }
 
 /// Compute cosine similarity between two embedding vectors
@@ -1148,7 +1146,8 @@ async fn remember(
     validation::validate_content(&req.content, false).map_validation_err("content")?;
 
     // Parse experience type from string, default to Context
-    let experience_type = req.experience_type
+    let experience_type = req
+        .experience_type
         .as_ref()
         .and_then(|s| match s.to_lowercase().as_str() {
             "task" => Some(ExperienceType::Task),
@@ -1277,7 +1276,8 @@ async fn batch_remember(
             let mut errors = 0usize;
 
             for item in items {
-                let experience_type = item.experience_type
+                let experience_type = item
+                    .experience_type
                     .as_ref()
                     .and_then(|s| match s.to_lowercase().as_str() {
                         "task" => Some(ExperienceType::Task),
@@ -1570,7 +1570,10 @@ async fn retrieve_memories(
             timestamp: chrono::Utc::now(),
             user_id: req.user_id.clone(),
             memory_id: None,
-            content_preview: req.query_text.as_ref().map(|q| q.chars().take(100).collect()),
+            content_preview: req
+                .query_text
+                .as_ref()
+                .map(|q| q.chars().take(100).collect()),
             experience_type: None,
             importance: None,
             count: Some(count),
@@ -3000,21 +3003,22 @@ async fn main() -> Result<()> {
     // Public routes - NO rate limiting (health checks, metrics, static files)
     // These must always be accessible for monitoring and Kubernetes probes
     let public_routes = Router::new()
-        .route("/", get(|| async { axum::response::Redirect::permanent("/static/live.html") }))
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::permanent("/static/live.html") }),
+        )
         .nest_service("/static", ServeDir::new("static"))
         .route("/health", get(health))
-        .route("/health/live", get(health_live))     // P0.9: Kubernetes liveness probe
-        .route("/health/ready", get(health_ready))   // P0.9: Kubernetes readiness probe
-        .route("/metrics", get(metrics_endpoint))    // P1.1: Prometheus metrics
+        .route("/health/live", get(health_live)) // P0.9: Kubernetes liveness probe
+        .route("/health/ready", get(health_ready)) // P0.9: Kubernetes readiness probe
+        .route("/metrics", get(metrics_endpoint)) // P1.1: Prometheus metrics
         .route("/api/events", get(memory_events_sse)) // SSE: Real-time memory events for dashboard
         .with_state(manager.clone());
 
     // Combine public and protected routes
     // Rate limiting is applied only to protected_routes (API endpoints)
     // Public routes (health, metrics, static) are NOT rate limited
-    let app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes);
+    let app = Router::new().merge(public_routes).merge(protected_routes);
 
     // Conditionally add trace propagation middleware only when telemetry feature is enabled
     #[cfg(feature = "telemetry")]

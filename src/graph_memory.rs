@@ -404,7 +404,8 @@ impl GraphMemory {
 
         // Load entity name index from persisted DB (O(n) but faster than deserializing entities)
         // If empty, migrate from entities_db (one-time migration for existing data)
-        let entity_name_index = Self::load_or_migrate_name_index(&entity_name_index_db, &entities_db)?;
+        let entity_name_index =
+            Self::load_or_migrate_name_index(&entity_name_index_db, &entities_db)?;
         let entity_count = entity_name_index.len();
 
         // Count relationships and episodes during startup (one-time cost)
@@ -428,7 +429,9 @@ impl GraphMemory {
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
             tracing::info!(
                 "Loaded graph with {} entities, {} relationships, {} episodes",
-                entity_count, relationship_count, episode_count
+                entity_count,
+                relationship_count,
+                episode_count
             );
         }
 
@@ -436,7 +439,10 @@ impl GraphMemory {
     }
 
     /// Load entity name->UUID index from persisted DB, or migrate from entities_db if empty
-    fn load_or_migrate_name_index(index_db: &DB, entities_db: &DB) -> Result<HashMap<String, Uuid>> {
+    fn load_or_migrate_name_index(
+        index_db: &DB,
+        entities_db: &DB,
+    ) -> Result<HashMap<String, Uuid>> {
         let mut index = HashMap::new();
 
         // Try to load from dedicated index DB first
@@ -523,7 +529,8 @@ impl GraphMemory {
             index.insert(entity.name.clone(), entity.uuid);
         }
         // Persist name->UUID mapping for O(1) startup
-        self.entity_name_index_db.put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
+        self.entity_name_index_db
+            .put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
 
         Ok(entity.uuid)
     }

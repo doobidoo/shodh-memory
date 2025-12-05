@@ -293,7 +293,11 @@ pub fn download_models_internal(
 
     // Download model (quantized ~23MB or full ~90MB)
     let (model_url, model_filename, model_checksum) = if use_quantized {
-        (MODEL_QUANTIZED_URL, "model_quantized.onnx", ModelChecksums::QUANTIZED_MODEL)
+        (
+            MODEL_QUANTIZED_URL,
+            "model_quantized.onnx",
+            ModelChecksums::QUANTIZED_MODEL,
+        )
     } else {
         (MODEL_ONNX_URL, "model.onnx", ModelChecksums::FULL_MODEL)
     };

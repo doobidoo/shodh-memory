@@ -47,9 +47,7 @@ pub fn validate_user_id(user_id: &str) -> Result<()> {
 
     // Reject leading/trailing dots which could be problematic on some filesystems
     if user_id.starts_with('.') || user_id.ends_with('.') {
-        return Err(anyhow!(
-            "user_id cannot start or end with a dot"
-        ));
+        return Err(anyhow!("user_id cannot start or end with a dot"));
     }
 
     Ok(())
@@ -289,7 +287,7 @@ mod tests {
         assert!(validate_user_id("a..b..c").is_err()); // multiple traversal
         assert!(validate_user_id(".hidden").is_err()); // leading dot
         assert!(validate_user_id("user.").is_err()); // trailing dot
-        // Valid uses of single dots in email-style user_ids
+                                                     // Valid uses of single dots in email-style user_ids
         assert!(validate_user_id("user.name@example.com").is_ok());
         assert!(validate_user_id("first.last").is_ok());
     }
