@@ -114,87 +114,6 @@ for mem in results:
 # [0.89] Detected obstacle at coordinates X=5.2, Y=10.1
 ```
 
-## Features
-
-### Multi-tier Memory Architecture
-```python
-# Working memory (immediate context)
-# Session memory (current mission)
-# Long-term memory (persistent knowledge)
-
-# Memories automatically tier based on access patterns
-stats = memory.get_stats()
-print(f"Working: {stats['working_memory_count']}")
-print(f"Session: {stats['session_memory_count']}")
-print(f"Long-term: {stats['long_term_memory_count']}")
-```
-
-### Mission Tracking
-```python
-# Track missions with waypoints and decisions
-memory.start_mission("patrol_sector_7", mission_type="patrol")
-
-memory.record_waypoint(
-    name="checkpoint_alpha",
-    position={"x": 10.0, "y": 20.0, "z": 0.0}
-)
-
-memory.record_decision(
-    situation="Path blocked by debris",
-    options=["go_around", "wait", "request_help"],
-    chosen="go_around",
-    reasoning="Alternative route available, time-critical mission"
-)
-
-memory.end_mission(
-    success=True,
-    summary="Patrol completed, 3 anomalies logged"
-)
-```
-
-### Anomaly Detection
-```python
-# Record and search anomalies
-memory.record_anomaly(
-    description="Unexpected heat signature in sector 4",
-    severity="high",
-    sensor_data={"temperature": 85.2, "baseline": 22.0}
-)
-
-# Find similar past anomalies
-anomalies = memory.find_anomalies(
-    query="heat anomaly",
-    severity="high",
-    limit=10
-)
-```
-
-### Spatial Memory
-```python
-from shodh_memory import GeoLocation, GeoFilter
-
-# Store with GPS coordinates
-memory.record(
-    content="Landing zone clear",
-    experience_type="observation",
-    geo_location=GeoLocation(
-        latitude=37.7749,
-        longitude=-122.4194,
-        altitude=10.0
-    )
-)
-
-# Query by location
-results = memory.retrieve(
-    query="landing",
-    geo_filter=GeoFilter(
-        center_lat=37.77,
-        center_lon=-122.42,
-        radius_km=1.0
-    )
-)
-```
-
 ## API Reference
 
 ### MemorySystem
@@ -202,29 +121,18 @@ results = memory.retrieve(
 | Method | Description |
 |--------|-------------|
 | `record(content, experience_type, ...)` | Store a memory |
-| `retrieve(query, limit)` | Semantic search |
-| `start_mission(name, mission_type)` | Begin mission tracking |
-| `end_mission(success, summary)` | End mission |
-| `record_waypoint(name, position)` | Log waypoint |
-| `record_decision(situation, options, chosen, reasoning)` | Log decision |
-| `record_anomaly(description, severity)` | Log anomaly |
-| `record_sensor(sensor_type, values)` | Log sensor data |
-| `find_anomalies(query, severity)` | Search anomalies |
-| `find_similar_decisions(situation)` | Find past decisions |
-| `get_stats()` | Memory statistics |
+| `retrieve(query, limit)` | Search memories |
+| `get_stats()` | Get statistics |
 | `flush()` | Persist to disk |
 
 ### Experience Types
 
 | Type | Use Case |
 |------|----------|
-| `observation` | Visual/sensor observations |
-| `action` | Actions taken |
-| `decision` | Decision points |
-| `sensor` | Raw sensor data |
-| `navigation` | Movement/waypoints |
-| `communication` | Messages sent/received |
-| `anomaly` | Unexpected events |
+| `observation` | What was seen/detected |
+| `action` | What was done |
+| `sensor` | Raw sensor readings |
+| `navigation` | Position/movement |
 
 ## REST API Server
 
