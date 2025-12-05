@@ -28,6 +28,98 @@ Most AI memory solutions require cloud connectivity. **Shodh-Memory runs 100% of
 
 Built in Rust with Python bindings. ~50MB footprint. Sub-millisecond retrieval.
 
+## How Memory Works
+
+### Three Pillars: Grammar, Hebbian Learning, and Decay
+
+Shodh-Memory is built on three principles from cognitive science:
+
+1. **Grammar as Structure** - Nouns become entities, verbs become relationships, adjectives modify importance.
+2. **Hebbian Learning** - Connections used together strengthen together. After 3 co-activations, they resist decay.
+3. **Salience-Weighted Decay** - Important memories persist; unimportant ones fade to gist (not arbitrary FIFO).
+
+```
+                              ┌─────────────────────────────────────────────────────────────────┐
+                              │                    GRAMMATICAL DECOMPOSITION                    │
+                              │                                                                 │
+                              │    "The drone detected a critical obstacle near the hangar"    │
+                              │         │              │           │              │             │
+                              │         ▼              ▼           ▼              ▼             │
+                              │    ┌─────────┐   ┌──────────┐ ┌──────────┐  ┌──────────┐       │
+                              │    │  NOUN   │   │   VERB   │ │ADJECTIVE │  │   NOUN   │       │
+                              │    │ "drone" │   │"detected"│ │"critical"│  │"obstacle"│       │
+                              │    └────┬────┘   └────┬─────┘ └────┬─────┘  └────┬─────┘       │
+                              │         │             │            │             │              │
+                              └─────────│─────────────│────────────│─────────────│──────────────┘
+                                        │             │            │             │
+                                        ▼             ▼            ▼             ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      GRAVITATIONAL MEMORY FIELD                                           │
+│                                                                                                           │
+│   NOUNS = Gravitational Wells                VERBS = Neural Pathways              ADJECTIVES = Modifiers │
+│   (Entities with mass/salience)              (Connections between wells)          (Filter & boost)        │
+│                                                                                                           │
+│        ╭──────────────────────────────────────────────────────────────────────────╮                       │
+│        │                                                                          │                       │
+│        │      ★ ═══════════════════════════════════════════════════ ★             │                       │
+│        │    drone                        detected                obstacle         │                       │
+│        │   (mass:0.7)                 [high arousal]             (mass:0.8)       │                       │
+│        │      │                      importance +0.3                 │            │                       │
+│        │      │                            │                         │◀── "critical" boosts              │
+│        │      │                            │                         │    salience by 1.5x               │
+│        │      │           ╭────────────────┴────────────╮            │                                    │
+│        │      │           │    hangar (mass: 0.5)       │            │                                    │
+│        │      │           │           ★                 │            │                                    │
+│        │      │           │    └── "near" relationship ─┘            │                                    │
+│        │      ╰───────────────────────────────────────────────────────╯                                   │
+│        │                                                                                                  │
+│        ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+│                                                                                                           │
+│   ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│   │  HEBBIAN DYNAMICS: "Neurons that fire together, wire together"                                      │ │
+│   │                                                                                                     │ │
+│   │  Co-activation count:  [1] ──▶ [2] ──▶ [3] ══▶ POTENTIATED (resists decay 10x)                     │ │
+│   │                                                                                                     │ │
+│   │  Decay formula:  w(t) = w₀ × e^(-λt)    where λ_potentiated = λ_normal / 10                        │ │
+│   │                                                                                                     │ │
+│   │  Pruning: Non-potentiated connections with strength < 0.1 are removed                               │ │
+│   └─────────────────────────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                                           │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                         MEMORY TIERING                                                    │
+│                                                                                                           │
+│   ┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐ │
+│   │  WORKING MEMORY   │ ───▶ │  SESSION MEMORY   │ ───▶ │  LONG-TERM STORE  │ ───▶ │     ARCHIVE       │ │
+│   │   (immediate)     │      │  (current task)   │      │   (persistent)    │      │   (compressed)    │ │
+│   │                   │      │                   │      │                   │      │                   │ │
+│   │  High-salience    │      │  Frequently       │      │  Potentiated      │      │  Low-salience     │ │
+│   │  entities stay    │      │  accessed stay    │      │  connections      │      │  gist only        │ │
+│   │  hot              │      │  active           │      │  persist          │      │  (nouns kept)     │ │
+│   └───────────────────┘      └───────────────────┘      └───────────────────┘      └───────────────────┘ │
+│                                                                                                           │
+│   Promotion criteria:                              Demotion criteria:                                     │
+│   • High-arousal verbs ("crashed", "discovered")   • Low access count                                     │
+│   • Proper nouns (names, places)                   • Structural verbs only ("is", "has")                  │
+│   • Frequent co-activation (3+ times)              • No connections to other memories                     │
+│   • User-marked importance                         • Time decay without reinforcement                     │
+│                                                                                                           │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Research Basis
+
+| Element | Role | Reference |
+|---------|------|-----------|
+| **Nouns** | Entities with salience | [Construction Grammar](https://direct.mit.edu/coli/article/50/4/1375/123787) |
+| **Verbs** | Relationships between entities | [Frame Semantics](https://sites.la.utexas.edu/hcb/files/2021/07/Boas-CxG-and-FS-2021-DRAFT.pdf) |
+| **Adjectives** | Importance modifiers | [Emotional Tagging](https://pmc.ncbi.nlm.nih.gov/articles/PMC10410470/) |
+| **Decay** | Salience-weighted forgetting | [Central vs Peripheral Memory](https://pmc.ncbi.nlm.nih.gov/articles/PMC4183265/) |
+
+Memory architecture based on [CoALA framework](https://arxiv.org/abs/2309.02427) (Princeton, 2024).
+
 ## Installation
 
 ```bash
@@ -192,16 +284,40 @@ RUST_LOG=info                       # Log level
 ```
 
 ```bash
-# Store memory
+# Store memory (simple)
+curl -X POST http://localhost:3030/api/remember \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "robot-001", "content": "Obstacle detected at entrance"}'
+
+# Search (simple)
+curl -X POST http://localhost:3030/api/recall \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "robot-001", "query": "obstacle", "limit": 5}'
+
+# Store with full metadata
 curl -X POST http://localhost:3030/api/record \
   -H "Content-Type: application/json" \
   -d '{"user_id": "robot-001", "content": "Obstacle detected", "experience_type": "observation"}'
 
-# Search
+# Search with filters
 curl -X POST http://localhost:3030/api/retrieve \
   -H "Content-Type: application/json" \
   -d '{"user_id": "robot-001", "query": "obstacle", "max_results": 5}'
 ```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/remember` | POST | Store memory (simple) |
+| `/api/recall` | POST | Search memories (simple) |
+| `/api/record` | POST | Store with full metadata |
+| `/api/retrieve` | POST | Search with filters |
+| `/api/batch_remember` | POST | Batch store |
+| `/api/memory/{id}` | GET/PUT/DELETE | CRUD operations |
+| `/api/users/{id}/stats` | GET | User statistics |
+| `/api/graph/{user_id}/stats` | GET | Graph statistics |
+| `/health` | GET | Health check |
 
 ## Performance
 
@@ -250,11 +366,16 @@ maturin build --release
 
 ## Roadmap
 
-- [ ] ARM64 Linux builds (Jetson Nano, Raspberry Pi)
-- [ ] ROS2 integration
-- [ ] Temporal queries ("what happened yesterday")
-- [ ] Memory compression for long-term storage
-- [ ] Multi-agent memory sharing
+### Near-term
+- [ ] ARM64 Linux builds (Jetson Nano, Raspberry Pi 4/5)
+- [ ] Temporal queries ("what happened yesterday", "last mission")
+- [ ] Memory consolidation for long-term storage compression
+- [ ] TypeScript/JavaScript client SDK
+
+### Future
+- [ ] ROS2 integration package
+- [ ] Fleet memory sync with sharding (multi-robot coordination)
+- [ ] Alternative embedding models (BGE-small, E5)
 
 ## License
 

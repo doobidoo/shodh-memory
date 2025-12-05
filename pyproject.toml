@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "shodh-memory"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local-first AI memory system for robotics, drones, and edge AI - 100% offline capable"
 authors = [{name = "Shodh Team", email = "29.varuns@gmail.com"}]
 license = {text = "Apache-2.0"}
@@ -32,9 +32,9 @@ keywords = [
 ]
 
 [project.urls]
-Homepage = "https://shodh-rag.com/memory"
+Homepage = "https://www.shodh-rag.com/memory"
 Repository = "https://github.com/varun29ankuS/shodh-memory"
-Documentation = "https://shodh-rag.com/memory"
+Documentation = "https://www.shodh-rag.com/memory"
 "Bug Tracker" = "https://github.com/varun29ankuS/shodh-memory/issues"
 
 [tool.maturin]
