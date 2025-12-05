@@ -17,16 +17,7 @@
 
 ---
 
-## Why Shodh-Memory?
-
-Most AI memory solutions require cloud connectivity. **Shodh-Memory runs 100% offline** - critical for:
-
-- **Robots** operating in warehouses, mines, or disaster zones
-- **Drones** flying beyond network coverage
-- **Defense systems** requiring air-gapped operation
-- **Privacy-sensitive** applications
-
-Built in Rust with Python bindings. ~50MB footprint. Sub-millisecond retrieval.
+Offline AI memory system for robotics and edge devices. Rust backend with Python bindings.
 
 ## How Memory Works
 
@@ -286,15 +277,6 @@ curl -X POST http://localhost:3030/api/retrieve \
 | `/api/graph/{user_id}/stats` | GET | Graph statistics |
 | `/health` | GET | Health check |
 
-## Performance
-
-| Metric | Value |
-|--------|-------|
-| Embedding latency | ~5ms (MiniLM-L6-v2) |
-| Search latency | <1ms (10K memories) |
-| Memory footprint | ~50MB |
-| Disk per 1K memories | ~2MB |
-
 ## Platform Support
 
 | Platform | Status |
@@ -303,17 +285,6 @@ curl -X POST http://localhost:3030/api/retrieve \
 | macOS ARM64 (Apple Silicon) | Supported |
 | Windows x86_64 | Supported |
 | Linux ARM64 (Jetson, Pi) | Coming soon |
-
-## Comparison
-
-| Feature | Shodh-Memory | ChromaDB | Mem0 |
-|---------|-------------|----------|------|
-| Offline-first | Yes | Partial | No |
-| Edge-optimized | Yes | No | No |
-| Mission tracking | Yes | No | No |
-| Spatial queries | Yes | No | No |
-| Memory footprint | 50MB | 200MB+ | Cloud |
-| Language | Rust+Python | Python | Python |
 
 ## Development
 
