@@ -49,6 +49,7 @@ docker run -p 3030:3030 shodh/memory
 |------|-------------|
 | `remember` | Store a memory with optional type and tags |
 | `recall` | Semantic search to find relevant memories |
+| `context_summary` | Get categorized context for session bootstrap |
 | `list_memories` | List all stored memories |
 | `forget` | Delete a specific memory by ID |
 | `memory_stats` | Get statistics about stored memories |

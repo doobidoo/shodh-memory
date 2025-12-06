@@ -5,234 +5,222 @@
 <h1 align="center">Shodh-Memory</h1>
 
 <p align="center">
-  <strong>Local-first AI memory for robotics, drones, and edge devices</strong>
-</p>
-
-<p align="center">
-  <a href="https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory"><img src="https://img.shields.io/badge/MCP-Registry-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyek0xMiAyMGMtNC40MSAwLTgtMy41OS04LThzMy41OS04IDgtOCA4IDMuNTkgOCA4LTMuNTkgOC04IDh6Ii8+PC9zdmc+" alt="MCP Registry"></a>
+  <a href="https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory"><img src="https://img.shields.io/badge/MCP-Registry-green" alt="MCP Registry"></a>
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
   <a href="https://pepy.tech/project/shodh-memory"><img src="https://static.pepy.tech/badge/shodh-memory" alt="Downloads"></a>
-  <a href="https://github.com/varun29ankuS/shodh-memory/actions"><img src="https://github.com/varun29ankuS/shodh-memory/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 
 ---
 
-Offline AI memory system for robotics and edge devices. Rust backend with Python bindings.
+A memory system that actually learns. Not just storage—cognitive processing.
 
-## How Memory Works
+Most AI memory solutions store vectors and retrieve by similarity. That's a database, not memory. Real memory strengthens connections that lead to good outcomes, lets unused information fade, and consolidates experiences into lasting knowledge.
 
-Shodh-Memory uses language structure to decide what to remember:
+Shodh-Memory implements these principles in a single 8MB binary that runs entirely offline.
+
+**The architecture:** Three tiers based on Cowan's working memory model [1]. New information enters working memory (limited capacity, fast access), overflows to session memory, and consolidates into long-term storage based on importance. This isn't a metaphor—it's how the data actually flows.
+
+**The learning:** When memories are retrieved together and the outcome is good, their connection strengthens. Classic Hebbian learning [2]—"neurons that fire together, wire together." After enough co-activations, these connections become permanent (long-term potentiation). Bad outcomes cause decay. Over time, the system learns what matters.
+
+**The result:** Memory that adapts to you. Your decisions, your errors, your patterns—searchable, local, private.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  INPUT: "The drone detected a critical obstacle near the hangar"            │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  1. PARSE                                                                   │
-│                                                                             │
-│     Nouns → Entities        Verbs → Relationships      Adjectives → Weight  │
-│     ─────────────────       ──────────────────────     ───────────────────  │
-│     "drone"                 "detected"                 "critical" (+1.5x)   │
-│     "obstacle"              "near"                                          │
-│     "hangar"                                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  2. STORE AS GRAPH                                                          │
-│                                                                             │
-│     [drone] ──detected──▶ [obstacle] ◀── "critical" boosts importance       │
-│                               │                                             │
-│                            ──near──▶ [hangar]                               │
-│                                                                             │
-│     Each entity tracks: mention_count, last_accessed, importance            │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  3. STRENGTHEN ON USE (Hebbian Learning)                                    │
-│                                                                             │
-│     Co-activation: [1] → [2] → [3] → STRONG (resists decay 10x)            │
-│                                                                             │
-│     Connections used together get stronger.                                 │
-│     After 3 co-activations, they become long-term.                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  4. DECAY OVER TIME                                                         │
-│                                                                             │
-│     Important memories decay slowly. Unimportant ones fade fast.            │
-│                                                                             │
-│     ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐            │
-│     │ WORKING │ ──▶ │ SESSION │ ──▶ │  LONG   │ ──▶ │ ARCHIVE │            │
-│     │ (now)   │     │ (task)  │     │  TERM   │     │ (gist)  │            │
-│     └─────────┘     └─────────┘     └─────────┘     └─────────┘            │
-│                                                                             │
-│     Promoted by: action verbs, proper nouns, frequent access                │
-│     Demoted by: low access, no connections, time without use                │
-└─────────────────────────────────────────────────────────────────────────────┘
+Working Memory ──overflow──▶ Session Memory ──importance──▶ Long-Term Memory
+   (100 items)                  (500 MB)                      (RocksDB)
 ```
 
-Based on [construction grammar](https://direct.mit.edu/coli/article/50/4/1375/123787), [Hebbian learning](https://pmc.ncbi.nlm.nih.gov/articles/PMC10410470/), [memory consolidation](https://pmc.ncbi.nlm.nih.gov/articles/PMC4183265/), and [working memory](https://pmc.ncbi.nlm.nih.gov/articles/PMC4207727/) research.
+### Architecture
 
-## Installation
+**Storage & Retrieval**
+● Vamana graph index for approximate nearest neighbor search [3]
+● MiniLM-L6 embeddings (384-dim) for semantic similarity
+● RocksDB for durable persistence across restarts
+● User isolation — each agent gets independent memory space
 
-```bash
+**Cognitive Processing**
+● *Activation decay* — exponential decay A(t) = A₀ · e^(-λt) applied each maintenance cycle (λ configurable)
+● *Hebbian strengthening* — co-retrieved memories form graph edges; edge weight w increases as w' = w + α(1 - w) on each co-activation
+● *Long-term potentiation* — edges surviving threshold co-activations (default: 5) become permanent, exempt from decay
+● *Importance scoring* — composite score from memory type, content length, entity density, technical terms, access frequency
+
+**Semantic Consolidation**
+● Episodic memories older than 7 days compress into semantic facts
+● Entity extraction preserves key information during compression
+● Original experiences archived, compressed form used for retrieval
+
+**Context Bootstrapping**
+● `context_summary()` provides categorized session context on startup
+● Returns decisions, learnings, patterns, errors — structured for LLM consumption
+● `brain_state()` exposes full 3-tier visualization data
+
+### Use cases
+
+**Local LLM memory** — Give Claude, GPT, or any local model persistent memory across sessions. Remember user preferences, past decisions, learned patterns.
+
+**Robotics & drones** — On-device experience accumulation. A robot that remembers which actions worked, which failed, without cloud round-trips.
+
+**Edge AI** — Run on Jetson, Raspberry Pi, industrial PCs. Sub-millisecond retrieval, zero network dependency.
+
+**Personal knowledge base** — Your own searchable memory. Decisions, learnings, discoveries—private and local.
+
+### Compared to alternatives
+
+| | Shodh-Memory | Mem0 | Cognee |
+|---|---|---|---|
+| **Deployment** | Single 8MB binary | Cloud API | Neo4j + Vector DB |
+| **Offline** | 100% | No | Partial |
+| **Learning** | Hebbian + decay + LTP | Vector similarity | Knowledge graphs |
+| **Latency** | Sub-millisecond | Network-bound | Database-bound |
+| **Best for** | Local-first, edge, privacy | Cloud scale | Enterprise ETL |
+
+### Installation
+
+**Claude Code / Claude Desktop:**
+
+Add to your `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "shodh-memory": {
+      "command": "npx",
+      "args": ["-y", "@shodh/memory-mcp"]
+    }
+  }
+}
+```
+
+Config file locations:
+● macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+● Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+● Linux: `~/.config/Claude/claude_desktop_config.json`
+
+**Python:**
+```
 pip install shodh-memory
 ```
 
-## Quick Start
-
-```python
-from shodh_memory import MemorySystem
-
-# Initialize (models download automatically on first use)
-memory = MemorySystem("./robot_memory")
-
-# Store experiences
-memory.record(
-    content="Detected obstacle at coordinates X=5.2, Y=10.1",
-    experience_type="observation",
-    tags=["obstacle", "navigation"]
-)
-
-memory.record(
-    content="Battery level critical at 15%",
-    experience_type="sensor",
-    tags=["battery", "warning"]
-)
-
-# Semantic search - finds relevant memories
-results = memory.retrieve("obstacle near position 5", limit=5)
-for mem in results:
-    print(f"[{mem['relevance']:.2f}] {mem['content']}")
-
-# Output:
-# [0.89] Detected obstacle at coordinates X=5.2, Y=10.1
+**From source:**
 ```
-
-## API Reference
-
-### MemorySystem
-
-| Method | Description |
-|--------|-------------|
-| `record(content, experience_type, ...)` | Store a memory |
-| `retrieve(query, limit)` | Search memories |
-| `get_stats()` | Get statistics |
-| `flush()` | Persist to disk |
-
-### Experience Types
-
-| Type | Use Case |
-|------|----------|
-| `observation` | What was seen/detected |
-| `action` | What was done |
-| `sensor` | Raw sensor readings |
-| `navigation` | Position/movement |
-
-## REST API Server
-
-For microservice architectures, run the HTTP server:
-
-```bash
-# From source
 cargo build --release
 ./target/release/shodh-memory-server
-
-# Environment variables
-PORT=3030                           # Server port
-STORAGE_PATH=./shodh_memory_data    # Data directory
-RUST_LOG=info                       # Log level
 ```
 
-```bash
-# Store memory (simple)
-curl -X POST http://localhost:3030/api/remember \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "robot-001", "content": "Obstacle detected at entrance"}'
+### Usage
 
-# Search (simple)
-curl -X POST http://localhost:3030/api/recall \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "robot-001", "query": "obstacle", "limit": 5}'
+**Python**
 
-# Store with full metadata
+```python
+from shodh_memory import Memory
+
+memory = Memory(user_id="my-agent")
+
+# Store
+memory.remember("User prefers dark mode", memory_type="Decision")
+memory.remember("JWT tokens expire after 24h", memory_type="Learning")
+
+# Search
+results = memory.recall("user preferences", limit=5)
+
+# Session bootstrap - get categorized context
+summary = memory.context_summary()
+# Returns: decisions, learnings, patterns, errors
+```
+
+**REST API**
+
+```
+# Store
 curl -X POST http://localhost:3030/api/record \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "robot-001", "content": "Obstacle detected", "experience_type": "observation"}'
+  -H "X-API-Key: your-key" \
+  -d '{
+    "user_id": "agent-1",
+    "experience": {
+      "content": "Deployment requires Docker 24+",
+      "experience_type": "Learning"
+    }
+  }'
 
-# Search with filters
+# Search
 curl -X POST http://localhost:3030/api/retrieve \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "robot-001", "query": "obstacle", "max_results": 5}'
+  -H "X-API-Key: your-key" \
+  -d '{"user_id": "agent-1", "query": "deployment requirements", "limit": 5}'
 ```
 
-### API Endpoints
+### Memory types
+
+Different types get different importance weights in the scoring model:
+
+● **Decision** (+0.30) — choices, preferences, conclusions
+● **Learning** (+0.25) — new knowledge, facts learned
+● **Error** (+0.25) — mistakes, things to avoid
+● **Discovery**, **Pattern** (+0.20) — findings, recurring behaviors
+● **Task** (+0.15) — work items
+● **Context**, **Observation** (+0.10) — general info
+
+Importance also increases with: content length, entity density, technical terms, and access frequency.
+
+### API reference
+
+**Python client**
+
+| Method | What it does |
+|--------|--------------|
+| `remember(content, memory_type, tags)` | Store a memory |
+| `recall(query, limit)` | Semantic search |
+| `context_summary()` | Categorized context for session start |
+| `brain_state()` | 3-tier visualization data |
+| `stats()` | Memory statistics |
+| `delete(memory_id)` | Remove a memory |
+
+**REST endpoints**
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/remember` | POST | Store memory (simple) |
-| `/api/recall` | POST | Search memories (simple) |
-| `/api/record` | POST | Store with full metadata |
-| `/api/retrieve` | POST | Search with filters |
-| `/api/batch_remember` | POST | Batch store |
-| `/api/memory/{id}` | GET/PUT/DELETE | CRUD operations |
+| `/api/record` | POST | Store memory |
+| `/api/retrieve` | POST | Semantic search |
+| `/api/memories` | POST | List memories |
+| `/api/memory/{id}` | GET/DELETE | Single memory operations |
 | `/api/users/{id}/stats` | GET | User statistics |
-| `/api/graph/{user_id}/stats` | GET | Graph statistics |
+| `/api/brain/{user_id}` | GET | 3-tier state |
 | `/health` | GET | Health check |
 
-## Platform Support
+### Configuration
 
-| Platform | Status |
-|----------|--------|
-| Linux x86_64 | Supported |
-| macOS ARM64 (Apple Silicon) | Supported |
-| Windows x86_64 | Supported |
-| Linux ARM64 (Jetson, Pi) | Coming soon |
-
-## Development
-
-```bash
-# Build from source
-git clone https://github.com/varun29ankuS/shodh-memory
-cd shodh-memory
-cargo build --release
-
-# Run tests
-cargo test
-
-# Build Python wheel
-pip install maturin
-maturin build --release
+```
+SHODH_PORT=3030                    # Default: 3030
+SHODH_MEMORY_PATH=./data           # Default: ./shodh_memory_data
+SHODH_API_KEYS=key1,key2           # Required in production
+SHODH_MAINTENANCE_INTERVAL=300     # Decay cycle (seconds)
+SHODH_ACTIVATION_DECAY=0.95        # Decay factor per cycle
 ```
 
-## Roadmap
+### Platform support
 
-### Near-term
-- [ ] ARM64 Linux builds (Jetson Nano, Raspberry Pi 4/5)
-- [ ] Temporal queries ("what happened yesterday", "last mission")
-- [ ] Memory consolidation for long-term storage compression
-- [ ] TypeScript/JavaScript client SDK
+| Platform | Status | Use case |
+|----------|--------|----------|
+| Linux x86_64 | ✓ | Servers, workstations |
+| macOS ARM64 | ✓ | Development (Apple Silicon) |
+| Windows x86_64 | ✓ | Development, industrial PCs |
+| Linux ARM64 | Coming soon | Jetson, Raspberry Pi, drones |
 
-### Future
-- [ ] ROS2 integration package
-- [ ] Fleet memory sync with sharding (multi-robot coordination)
-- [ ] Alternative embedding models (BGE-small, E5)
+### References
 
-## License
+[1] Cowan, N. (2010). The Magical Mystery Four: How is Working Memory Capacity Limited, and Why? *Current Directions in Psychological Science*, 19(1), 51-57. https://pmc.ncbi.nlm.nih.gov/articles/PMC4207727/
+
+[2] Magee, J.C., & Grienberger, C. (2020). Synaptic Plasticity Forms and Functions. *Annual Review of Neuroscience*, 43, 95-117. https://pmc.ncbi.nlm.nih.gov/articles/PMC10410470/
+
+[3] Subramanya, S.J., et al. (2019). DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node. *NeurIPS 2019*. https://papers.nips.cc/paper/9527-diskann-fast-accurate-billion-point-nearest-neighbor-search-on-a-single-node
+
+[4] Dudai, Y., Karni, A., & Born, J. (2015). The Consolidation and Transformation of Memory. *Neuron*, 88(1), 20-32. https://pmc.ncbi.nlm.nih.gov/articles/PMC4183265/
+
+### License
 
 Apache 2.0
 
-## Links
+---
 
-- [Website](https://www.shodh-rag.com/memory)
-- [PyPI Package](https://pypi.org/project/shodh-memory/)
-- [GitHub](https://github.com/varun29ankuS/shodh-memory)
-- [Issues](https://github.com/varun29ankuS/shodh-memory/issues)
-- Email: 29.varuns@gmail.com
+[MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory) · [PyPI](https://pypi.org/project/shodh-memory/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [GitHub](https://github.com/varun29ankuS/shodh-memory)
