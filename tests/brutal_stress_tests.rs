@@ -584,9 +584,11 @@ fn test_brutal_dense_graph() {
         .expect("Failed");
 
     let stats = system.graph_stats();
+    // Due to MAX_COACTIVATION_SIZE=20 cap in record_coactivation (O(n²) protection),
+    // only first 20 memories get edges: 20*19/2 = 190 edges max
     assert!(
-        stats.edge_count >= 1000,
-        "Should have many edges: {}",
+        stats.edge_count >= 150,
+        "Should have many edges (capped by MAX_COACTIVATION_SIZE): {}",
         stats.edge_count
     );
 

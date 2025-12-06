@@ -515,9 +515,6 @@ impl MultiUserMemoryManager {
 
         info!("✅ Flushed 1 audit database and {} user databases", flushed);
 
-        // Give RocksDB a moment to complete background tasks
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
         Ok(())
     }
 
@@ -777,6 +774,53 @@ impl MultiUserMemoryManager {
         let graph_guard = graph.read();
         graph_guard.get_stats()
     }
+
+    /// Run maintenance on all cached user memories
+    ///
+    /// This is called periodically by the background scheduler to:
+    /// 1. Consolidate memories (tier promotion based on thresholds)
+    /// 2. Decay activation levels
+    /// 3. Run graph maintenance
+    ///
+    /// Only operates on currently cached users - evicted users will run
+    /// maintenance on next access.
+    pub fn run_maintenance_all_users(&self) -> usize {
+        let decay_factor = self.server_config.activation_decay_factor;
+        let mut total_processed = 0;
+
+        // Get list of cached user IDs (hold lock briefly)
+        let user_ids: Vec<String> = {
+            let cache = self.user_memories.lock();
+            cache.iter().map(|(id, _)| id.clone()).collect()
+        };
+
+        let user_count = user_ids.len();
+
+        for user_id in user_ids {
+            // Re-acquire memory for each user (may have been evicted)
+            if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                let memory = memory_lock.read();
+                match memory.run_maintenance(decay_factor) {
+                    Ok(count) => total_processed += count,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Maintenance failed for user {}: {}",
+                            user_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Maintenance complete: {} memories processed across {} users",
+            total_processed,
+            user_count
+        );
+
+        total_processed
+    }
 }
 
 /// API request/response types
@@ -893,6 +937,78 @@ struct BatchRememberResponse {
     ids: Vec<String>,
     success_count: usize,
     error_count: usize,
+}
+
+// =============================================================================
+// HEBBIAN FEEDBACK API - Wires up the learning loop
+// =============================================================================
+
+/// Request for tracked retrieval (returns tracking ID for later feedback)
+#[derive(Debug, Deserialize)]
+struct TrackedRetrieveRequest {
+    user_id: String,
+    query: String,
+    #[serde(default = "default_recall_limit")]
+    limit: usize,
+}
+
+/// Response with tracking ID for feedback
+#[derive(Debug, Serialize)]
+struct TrackedRetrieveResponse {
+    tracking_id: String,
+    memory_ids: Vec<String>,
+    memories: Vec<RecallMemory>,
+}
+
+/// Request to provide feedback on retrieval outcome
+#[derive(Debug, Deserialize)]
+struct ReinforceFeedbackRequest {
+    user_id: String,
+    memory_ids: Vec<String>,
+    /// "helpful", "misleading", or "neutral"
+    outcome: String,
+}
+
+/// Response from reinforcement
+#[derive(Debug, Serialize)]
+struct ReinforceFeedbackResponse {
+    memories_processed: usize,
+    associations_strengthened: usize,
+    importance_boosts: usize,
+    importance_decays: usize,
+}
+
+// =============================================================================
+// SEMANTIC CONSOLIDATION API - Extracts durable facts from episodic memories
+// =============================================================================
+
+/// Request to trigger consolidation
+#[derive(Debug, Deserialize)]
+struct ConsolidateRequest {
+    user_id: String,
+    /// Minimum number of supporting memories for a fact (default: 2)
+    #[serde(default = "default_min_support")]
+    min_support: usize,
+    /// Minimum age in days before consolidation (default: 7)
+    #[serde(default = "default_min_age_days")]
+    min_age_days: i64,
+}
+
+fn default_min_support() -> usize {
+    2
+}
+
+fn default_min_age_days() -> i64 {
+    7
+}
+
+/// Response from consolidation
+#[derive(Debug, Serialize)]
+struct ConsolidateResponse {
+    memories_analyzed: usize,
+    facts_extracted: usize,
+    facts_reinforced: usize,
+    fact_ids: Vec<String>,
 }
 
 /// Application state
@@ -1243,6 +1359,214 @@ async fn recall(
     }))
 }
 
+// =============================================================================
+// HEBBIAN FEEDBACK HANDLERS - Closes the learning loop
+// =============================================================================
+
+/// Tracked retrieval - returns tracking info for later feedback
+/// POST /api/retrieve/tracked
+///
+/// Use this when you want to provide feedback later on whether memories were helpful.
+/// Returns memory_ids that can be passed to /api/reinforce.
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, query = %req.query))]
+async fn retrieve_tracked(
+    State(state): State<AppState>,
+    Json(req): Json<TrackedRetrieveRequest>,
+) -> Result<Json<TrackedRetrieveResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let query_text = req.query.clone();
+    let limit = req.limit;
+
+    let memories = {
+        let memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let memory_guard = memory.read();
+            let query = MemoryQuery {
+                query_text: Some(query_text),
+                max_results: limit,
+                ..Default::default()
+            };
+            memory_guard.retrieve(&query).unwrap_or_default()
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    };
+
+    // Extract memory IDs for tracking
+    let memory_ids: Vec<String> = memories.iter().map(|m| m.id.0.to_string()).collect();
+
+    // Generate tracking ID (could be stored for audit, but for now just a UUID)
+    let tracking_id = uuid::Uuid::new_v4().to_string();
+
+    // Convert to response format
+    let recall_memories: Vec<RecallMemory> = memories
+        .into_iter()
+        .map(|m| RecallMemory {
+            id: m.id.0.to_string(),
+            content: m.experience.content.clone(),
+            importance: m.importance(),
+            created_at: m.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(TrackedRetrieveResponse {
+        tracking_id,
+        memory_ids,
+        memories: recall_memories,
+    }))
+}
+
+/// Reinforce memories based on task outcome - THIS IS THE HEBBIAN FEEDBACK ENDPOINT
+/// POST /api/reinforce
+///
+/// Call this after using memories to complete a task:
+/// - "helpful": Memories that helped → boost importance, strengthen associations
+/// - "misleading": Memories that misled → reduce importance, don't strengthen
+/// - "neutral": Just record access, mild strengthening
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, outcome = %req.outcome, count = req.memory_ids.len()))]
+async fn reinforce_feedback(
+    State(state): State<AppState>,
+    Json(req): Json<ReinforceFeedbackRequest>,
+) -> Result<Json<ReinforceFeedbackResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.memory_ids.is_empty() {
+        return Ok(Json(ReinforceFeedbackResponse {
+            memories_processed: 0,
+            associations_strengthened: 0,
+            importance_boosts: 0,
+            importance_decays: 0,
+        }));
+    }
+
+    // Parse outcome
+    let outcome = match req.outcome.to_lowercase().as_str() {
+        "helpful" => crate::memory::RetrievalOutcome::Helpful,
+        "misleading" => crate::memory::RetrievalOutcome::Misleading,
+        "neutral" | _ => crate::memory::RetrievalOutcome::Neutral,
+    };
+
+    // Convert string IDs to MemoryId
+    let memory_ids: Vec<crate::memory::MemoryId> = req
+        .memory_ids
+        .iter()
+        .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+        .map(crate::memory::MemoryId)
+        .collect();
+
+    if memory_ids.is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "memory_ids".to_string(),
+            reason: "No valid UUIDs provided".to_string(),
+        });
+    }
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    // Run reinforcement in blocking task (involves RocksDB writes)
+    let stats = {
+        let memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let memory_guard = memory.read();
+            memory_guard.reinforce_retrieval(&memory_ids, outcome)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
+    };
+
+    tracing::info!(
+        user_id = %req.user_id,
+        processed = stats.memories_processed,
+        strengthened = stats.associations_strengthened,
+        boosts = stats.importance_boosts,
+        decays = stats.importance_decays,
+        "Hebbian reinforcement applied"
+    );
+
+    Ok(Json(ReinforceFeedbackResponse {
+        memories_processed: stats.memories_processed,
+        associations_strengthened: stats.associations_strengthened,
+        importance_boosts: stats.importance_boosts,
+        importance_decays: stats.importance_decays,
+    }))
+}
+
+// =============================================================================
+// SEMANTIC CONSOLIDATION HANDLER - Extract durable facts from episodic memories
+// =============================================================================
+
+/// Consolidate memories into semantic facts
+/// POST /api/consolidate
+///
+/// Analyzes memories to extract durable semantic facts (preferences, procedures, patterns).
+/// Facts are reinforced when seen multiple times across different memories.
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+async fn consolidate_memories(
+    State(state): State<AppState>,
+    Json(req): Json<ConsolidateRequest>,
+) -> Result<Json<ConsolidateResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let min_support = req.min_support;
+    let min_age_days = req.min_age_days;
+
+    // Run consolidation in blocking task
+    let result = {
+        let memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let memory_guard = memory.read();
+
+            // Get all memories for consolidation
+            let all_memories = memory_guard.get_all_memories()?;
+
+            // Convert SharedMemory to Memory for consolidator
+            let memories: Vec<crate::memory::types::Memory> = all_memories
+                .into_iter()
+                .map(|arc_mem| (*arc_mem).clone())
+                .collect();
+
+            // Create consolidator with custom thresholds
+            let consolidator = crate::memory::SemanticConsolidator::with_thresholds(
+                min_support,
+                min_age_days,
+            );
+
+            // Run consolidation
+            Ok::<_, anyhow::Error>(consolidator.consolidate(&memories))
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
+    };
+
+    tracing::info!(
+        user_id = %req.user_id,
+        memories_processed = result.memories_processed,
+        facts_extracted = result.facts_extracted,
+        facts_reinforced = result.facts_reinforced,
+        "Semantic consolidation complete"
+    );
+
+    Ok(Json(ConsolidateResponse {
+        memories_analyzed: result.memories_processed,
+        facts_extracted: result.facts_extracted,
+        facts_reinforced: result.facts_reinforced,
+        fact_ids: result.new_fact_ids,
+    }))
+}
+
 /// Batch /api/batch_remember - store multiple memories at once (efficient for bulk)
 /// Example: POST /api/batch_remember { "user_id": "agent-1", "memories": [{"content": "..."}, ...] }
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id, count = req.memories.len()))]
@@ -1396,41 +1720,76 @@ async fn retrieve_memories(
                 let mut memory_graph_boosts: std::collections::HashMap<uuid::Uuid, f32> =
                     std::collections::HashMap::new();
 
+                // =================================================================
+                // SPREADING ACTIVATION (Anderson & Pirolli 1984)
+                // Multi-hop activation with exponential decay
+                // =================================================================
+                const DECAY_RATE: f32 = 0.5; // λ: decay rate per hop
+                const MAX_HOPS: usize = 3;   // Maximum traversal depth
+
                 if !query_entities.is_empty() {
                     if let Ok(graph) = state_clone.get_user_graph(&user_id) {
                         let graph_guard = graph.read();
 
-                        // For each query entity, find related memories through graph
-                        // Use SALIENCE for boost - high-salience entities (gravitational wells) provide stronger boost
+                        // Track visited entities to avoid cycles
+                        let mut visited_entities: std::collections::HashSet<uuid::Uuid> =
+                            std::collections::HashSet::new();
+
+                        // Initialize activation from query entities (hop 0)
+                        let mut current_level: Vec<(uuid::Uuid, f32)> = Vec::new();
+
                         for (entity_name, _) in &query_entities {
                             if let Ok(Some(entity_node)) =
                                 graph_guard.find_entity_by_name(entity_name)
                             {
-                                // Get episodes (memories) connected to this entity
+                                // Initial activation = entity salience (IC weight)
+                                let initial_activation = entity_node.salience;
+                                current_level.push((entity_node.uuid, initial_activation));
+                                visited_entities.insert(entity_node.uuid);
+
+                                // Hop 0: Direct episodes get full activation
                                 if let Ok(episodes) =
                                     graph_guard.get_episodes_by_entity(&entity_node.uuid)
                                 {
                                     for episode in episodes {
-                                        // Boost = entity salience * 0.5 (high-salience entities give stronger boost)
-                                        // A salience of 1.0 gives 50% boost, salience of 0.3 gives 15% boost
-                                        let boost = entity_node.salience * 0.5;
+                                        let boost = initial_activation * 0.5;
                                         *memory_graph_boosts.entry(episode.uuid).or_insert(0.0) +=
                                             boost;
                                     }
                                 }
+                            }
+                        }
 
-                                // Also traverse 1-hop relationships for indirect activation
-                                // Indirect connections are weighted by edge strength AND connected entity salience
+                        // Spread activation through hops 1 to MAX_HOPS
+                        for hop in 1..=MAX_HOPS {
+                            if current_level.is_empty() {
+                                break;
+                            }
+
+                            // Decay factor: A(d) = A₀ × e^(-λd)
+                            let decay = (-DECAY_RATE * hop as f32).exp();
+                            let mut next_level: Vec<(uuid::Uuid, f32)> = Vec::new();
+
+                            for (entity_uuid, activation) in &current_level {
+                                // Spread to connected entities via edges
                                 if let Ok(edges) =
-                                    graph_guard.get_entity_relationships(&entity_node.uuid)
+                                    graph_guard.get_entity_relationships(entity_uuid)
                                 {
                                     for edge in edges {
-                                        let connected_uuid = if edge.from_entity == entity_node.uuid
-                                        {
+                                        let connected_uuid = if edge.from_entity == *entity_uuid {
                                             edge.to_entity
                                         } else {
                                             edge.from_entity
                                         };
+
+                                        // Skip already visited entities
+                                        if visited_entities.contains(&connected_uuid) {
+                                            continue;
+                                        }
+                                        visited_entities.insert(connected_uuid);
+
+                                        // Spread activation = parent × edge_strength × decay
+                                        let spread_activation = activation * edge.strength * decay;
 
                                         // Get connected entity's salience for weighting
                                         let connected_salience = graph_guard
@@ -1440,21 +1799,27 @@ async fn retrieve_memories(
                                             .map(|e| e.salience)
                                             .unwrap_or(0.3);
 
+                                        // Boost connected episodes with spread activation
                                         if let Ok(connected_episodes) =
                                             graph_guard.get_episodes_by_entity(&connected_uuid)
                                         {
                                             for episode in connected_episodes {
-                                                // Decayed boost: edge_strength * connected_salience * decay_factor
-                                                let boost =
-                                                    edge.strength * connected_salience * 0.3;
+                                                // Boost = spread_activation × connected_salience
+                                                let boost = spread_activation * connected_salience * 0.5;
                                                 *memory_graph_boosts
                                                     .entry(episode.uuid)
                                                     .or_insert(0.0) += boost;
                                             }
                                         }
+
+                                        // Add to next level for further spreading
+                                        next_level.push((connected_uuid, spread_activation * connected_salience));
                                     }
                                 }
                             }
+
+                            // Move to next level
+                            current_level = next_level;
                         }
                     }
                 }
@@ -2759,6 +3124,133 @@ async fn get_memory_universe(
     Ok(Json(universe))
 }
 
+// ====== Brain State Visualization API ======
+
+/// Brain state response with memories organized by tier and activation levels
+#[derive(Debug, Serialize)]
+struct BrainStateResponse {
+    working_memory: Vec<MemoryNeuron>,
+    session_memory: Vec<MemoryNeuron>,
+    longterm_memory: Vec<MemoryNeuron>,
+    stats: BrainStats,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryNeuron {
+    id: String,
+    content_preview: String,
+    activation: f32,
+    importance: f32,
+    tier: String,
+    access_count: u32,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrainStats {
+    total_memories: usize,
+    working_count: usize,
+    session_count: usize,
+    longterm_count: usize,
+    avg_activation: f32,
+    avg_importance: f32,
+}
+
+/// Get brain state visualization - shows all memories with activation levels by tier
+async fn get_brain_state(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<BrainStateResponse>, AppError> {
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory.read();
+
+    // Gather memories from all tiers using public accessors
+    let mut working_memory = Vec::new();
+    let mut session_memory = Vec::new();
+    let mut longterm_memory = Vec::new();
+    let mut total_activation = 0.0f32;
+    let mut total_importance = 0.0f32;
+
+    // Get working memory via public accessor
+    for mem in memory_guard.get_working_memories() {
+        let neuron = MemoryNeuron {
+            id: mem.id.0.to_string(),
+            content_preview: mem.experience.content.chars().take(100).collect(),
+            activation: mem.activation(),
+            importance: mem.importance(),
+            tier: "working".to_string(),
+            access_count: mem.metadata_snapshot().access_count,
+            created_at: mem.created_at.to_rfc3339(),
+        };
+        total_activation += neuron.activation;
+        total_importance += neuron.importance;
+        working_memory.push(neuron);
+    }
+
+    // Get session memory via public accessor
+    for mem in memory_guard.get_session_memories() {
+        let neuron = MemoryNeuron {
+            id: mem.id.0.to_string(),
+            content_preview: mem.experience.content.chars().take(100).collect(),
+            activation: mem.activation(),
+            importance: mem.importance(),
+            tier: "session".to_string(),
+            access_count: mem.metadata_snapshot().access_count,
+            created_at: mem.created_at.to_rfc3339(),
+        };
+        total_activation += neuron.activation;
+        total_importance += neuron.importance;
+        session_memory.push(neuron);
+    }
+
+    // Get sample of longterm memory via public accessor (limit to avoid huge responses)
+    let longterm_sample = memory_guard.get_longterm_memories(50).unwrap_or_default();
+    for mem in longterm_sample {
+        let neuron = MemoryNeuron {
+            id: mem.id.0.to_string(),
+            content_preview: mem.experience.content.chars().take(100).collect(),
+            activation: mem.activation(),
+            importance: mem.importance(),
+            tier: "longterm".to_string(),
+            access_count: mem.metadata_snapshot().access_count,
+            created_at: mem.created_at.to_rfc3339(),
+        };
+        total_activation += neuron.activation;
+        total_importance += neuron.importance;
+        longterm_memory.push(neuron);
+    }
+
+    let total_count = working_memory.len() + session_memory.len() + longterm_memory.len();
+    let stats = BrainStats {
+        total_memories: total_count,
+        working_count: working_memory.len(),
+        session_count: session_memory.len(),
+        longterm_count: longterm_memory.len(),
+        avg_activation: if total_count > 0 {
+            total_activation / total_count as f32
+        } else {
+            0.0
+        },
+        avg_importance: if total_count > 0 {
+            total_importance / total_count as f32
+        } else {
+            0.0
+        },
+    };
+
+    Ok(Json(BrainStateResponse {
+        working_memory,
+        session_memory,
+        longterm_memory,
+        stats,
+    }))
+}
+
 // ====== Memory Visualization API Endpoints ======
 
 /// Get visualization statistics for a user's memory graph
@@ -2828,30 +3320,79 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(feature = "telemetry"))]
     {
-        // Use simple console logging for edge devices
+        // Default to info level if RUST_LOG not set (user-friendly default)
+        if std::env::var("RUST_LOG").is_err() {
+            std::env::set_var("RUST_LOG", "shodh_memory=info,tower_http=warn");
+        }
         tracing_subscriber::fmt::init();
-        info!("📝 Console logging initialized (telemetry disabled)");
     }
+
+    // Print startup banner (always visible, regardless of log level)
+    eprintln!();
+    eprintln!("  ╔═══════════════════════════════════════════════════╗");
+    eprintln!("  ║         🧠 Shodh-Memory Server v{}          ║", env!("CARGO_PKG_VERSION"));
+    eprintln!("  ║       Cognitive Memory for AI Agents              ║");
+    eprintln!("  ╚═══════════════════════════════════════════════════╝");
+    eprintln!();
 
     // P1.1: Register Prometheus metrics
     metrics::register_metrics().expect("Failed to register metrics");
-    info!("📊 Metrics registered at /metrics");
-
-    info!("🧠 Starting Shodh-Memory server...");
 
     // Load configuration from environment
     let server_config = ServerConfig::from_env();
-    server_config.log();
+
+    // Print configuration (always visible)
+    eprintln!("  📋 Configuration:");
+    eprintln!("     Mode:    {}", if server_config.is_production { "PRODUCTION" } else { "Development" });
+    eprintln!("     Port:    {}", server_config.port);
+    eprintln!("     Storage: {}", server_config.storage_path.display());
+    eprintln!();
 
     // Create memory manager with config
-    info!("📁 Storage path: {:?}", server_config.storage_path);
     let manager = Arc::new(MultiUserMemoryManager::new(
         server_config.storage_path.clone(),
         server_config.clone(),
     )?);
 
+    // Print storage statistics (always visible)
+    let storage_path = &server_config.storage_path;
+    if storage_path.exists() {
+        let disk_usage = calculate_dir_size(storage_path);
+        let user_count = count_user_directories(storage_path);
+        eprintln!("  💾 Storage Statistics:");
+        eprintln!("     Location:  {}", storage_path.canonicalize().unwrap_or_else(|_| storage_path.clone()).display());
+        eprintln!("     Disk used: {}", format_bytes(disk_usage));
+        eprintln!("     Users:     {}", user_count);
+        eprintln!();
+    } else {
+        eprintln!("  💾 Storage: New database (no existing data)");
+        eprintln!();
+    }
+
     // Keep a reference to manager for shutdown cleanup (clone BEFORE moving into router)
     let manager_for_shutdown = Arc::clone(&manager);
+
+    // Start background maintenance scheduler (consolidation, activation decay, graph pruning)
+    let maintenance_interval = server_config.maintenance_interval_secs;
+    let manager_for_maintenance = Arc::clone(&manager);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(maintenance_interval));
+
+        loop {
+            interval.tick().await;
+
+            // Run maintenance in blocking thread pool to avoid blocking async runtime
+            let manager_clone = Arc::clone(&manager_for_maintenance);
+            tokio::task::spawn_blocking(move || {
+                manager_clone.run_maintenance_all_users();
+            });
+        }
+    });
+    info!(
+        "🔄 Background maintenance scheduler started (interval: {}s)",
+        maintenance_interval
+    );
 
     // Configure rate limiting from config
     let governor_conf = GovernorConfigBuilder::default()
@@ -2882,6 +3423,11 @@ async fn main() -> Result<()> {
         .route("/api/remember", post(remember))
         .route("/api/recall", post(recall))
         .route("/api/batch_remember", post(batch_remember))
+        // Hebbian Feedback Loop - Wire up learning from task outcomes
+        .route("/api/retrieve/tracked", post(retrieve_tracked))
+        .route("/api/reinforce", post(reinforce_feedback))
+        // Semantic Consolidation - Extract durable facts from episodic memories
+        .route("/api/consolidate", post(consolidate_memories))
         // User management
         .route("/api/users", get(list_users))
         .route("/api/users/{user_id}/stats", get(get_user_stats))
@@ -2931,6 +3477,8 @@ async fn main() -> Result<()> {
             get(get_visualization_dot),
         )
         .route("/api/visualization/build", post(build_visualization))
+        // Brain State Visualization (cognitive memory tiers with activation levels)
+        .route("/api/brain/{user_id}", get(get_brain_state))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         // Apply rate limiting to API routes only (not health/metrics/static)
@@ -2982,7 +3530,22 @@ async fn main() -> Result<()> {
     // Start server using port from config
     let port = server_config.port;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    info!("🚀 Server listening on http://{}", addr);
+
+    // Small delay to let any pending log messages flush
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Print server ready message (always visible)
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+    eprintln!();
+    eprintln!("  🚀 Server ready!");
+    eprintln!("     HTTP:      http://{}", addr);
+    eprintln!("     Health:    http://{}/health", addr);
+    eprintln!("     Dashboard: http://{}/static/live.html", addr);
+    eprintln!();
+    eprintln!("  Press Ctrl+C to stop");
+    eprintln!();
+    let _ = std::io::stderr().flush();
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -3060,7 +3623,56 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Handle graceful shutdown
+// =============================================================================
+// Startup Helper Functions
+// =============================================================================
+
+/// Calculate total size of a directory recursively
+fn calculate_dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += calculate_dir_size(&path);
+            } else if let Ok(metadata) = entry.metadata() {
+                total += metadata.len();
+            }
+        }
+    }
+    total
+}
+
+/// Count user directories in storage path
+fn count_user_directories(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Format bytes as human-readable string
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Handle graceful shutdown signals (Ctrl+C and SIGTERM)
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()

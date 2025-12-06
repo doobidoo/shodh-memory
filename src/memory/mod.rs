@@ -633,6 +633,25 @@ impl MemorySystem {
         Ok(all_memories)
     }
 
+    /// Get memories from working memory tier (highest activation, most recent)
+    pub fn get_working_memories(&self) -> Vec<SharedMemory> {
+        let working = self.working_memory.read();
+        working.all_memories()
+    }
+
+    /// Get memories from session memory tier (medium-term, consolidated)
+    pub fn get_session_memories(&self) -> Vec<SharedMemory> {
+        let session = self.session_memory.read();
+        session.all_memories()
+    }
+
+    /// Get memories from long-term memory tier (persistent, lower activation)
+    /// Returns up to `limit` memories to avoid overwhelming responses
+    pub fn get_longterm_memories(&self, limit: usize) -> Result<Vec<Memory>> {
+        let all = self.long_term_memory.get_all()?;
+        Ok(all.into_iter().take(limit).collect())
+    }
+
     /// Calculate temporal relevance based on memory age (ENTERPRISE FEATURE)
     ///
     /// Implements exponential decay curve for time-aware memory retrieval:
@@ -871,8 +890,10 @@ impl MemorySystem {
                 .write()
                 .log_promoted(&memory.id, "working", "session", count);
 
-            // Clone out of Arc to get owned Memory for session storage
-            session.add((**memory).clone())?;
+            // Clone out of Arc and update tier before session storage
+            let mut promoted_memory = (**memory).clone();
+            promoted_memory.promote(); // Working -> Session
+            session.add(promoted_memory)?;
             working.remove(&memory.id)?;
         }
 
@@ -894,8 +915,9 @@ impl MemorySystem {
                 .write()
                 .log_promoted(&memory.id, "session", "longterm", count);
 
-            // Clone out of Arc to get owned Memory
-            let owned_memory = (**memory).clone();
+            // Clone out of Arc and update tier before long-term storage
+            let mut owned_memory = (**memory).clone();
+            owned_memory.promote(); // Session -> LongTerm
 
             // Compress if old enough
             let compressed_memory = if self.should_compress(&owned_memory) {
@@ -1282,6 +1304,51 @@ impl MemorySystem {
     /// Get memory graph statistics
     pub fn graph_stats(&self) -> MemoryGraphStats {
         self.retriever.graph_stats()
+    }
+
+    /// Run periodic maintenance (consolidation, activation decay, graph maintenance)
+    ///
+    /// Call this periodically (e.g., every 5 minutes) to:
+    /// 1. Promote memories between tiers based on thresholds
+    /// 2. Decay activation levels on all memories
+    /// 3. Run graph maintenance (prune weak edges)
+    ///
+    /// Returns the number of memories processed for activation decay.
+    pub fn run_maintenance(&self, decay_factor: f32) -> Result<usize> {
+        // 1. Consolidation: promote memories between tiers
+        self.consolidate_if_needed()?;
+
+        // 2. Decay activation on all in-memory memories (working + session)
+        let mut decayed_count = 0;
+
+        // Decay working memory activations
+        {
+            let working = self.working_memory.read();
+            for memory in working.all_memories() {
+                memory.decay_activation(decay_factor);
+                decayed_count += 1;
+            }
+        }
+
+        // Decay session memory activations
+        {
+            let session = self.session_memory.read();
+            for memory in session.all_memories() {
+                memory.decay_activation(decay_factor);
+                decayed_count += 1;
+            }
+        }
+
+        // 3. Graph maintenance: prune weak edges
+        self.graph_maintenance();
+
+        tracing::debug!(
+            "Maintenance complete: {} memories decayed (factor={})",
+            decayed_count,
+            decay_factor
+        );
+
+        Ok(decayed_count)
     }
 }
 

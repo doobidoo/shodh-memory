@@ -45,7 +45,10 @@ impl Default for CorsConfig {
 }
 
 impl CorsConfig {
-    /// Load from environment variable SHODH_CORS_ORIGINS
+    /// Load from environment variables with production safety checks
+    ///
+    /// In production mode (SHODH_ENV=production), warns if CORS origins are not configured.
+    /// This prevents accidentally running in production with permissive CORS.
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
@@ -81,6 +84,20 @@ impl CorsConfig {
             if let Ok(n) = val.parse() {
                 config.max_age_seconds = n;
             }
+        }
+
+        // Production safety check: warn if CORS is permissive in production
+        let is_production = env::var("SHODH_ENV")
+            .map(|v| {
+                let v = v.to_lowercase();
+                v == "production" || v == "prod"
+            })
+            .unwrap_or(false);
+
+        if is_production && config.allowed_origins.is_empty() {
+            tracing::warn!(
+                "⚠️  PRODUCTION WARNING: CORS allows all origins. Set SHODH_CORS_ORIGINS for security."
+            );
         }
 
         config
@@ -184,6 +201,14 @@ pub struct ServerConfig {
 
     /// CORS configuration
     pub cors: CorsConfig,
+
+    /// Memory maintenance interval in seconds (default: 300 = 5 minutes)
+    /// Controls how often consolidation and activation decay run
+    pub maintenance_interval_secs: u64,
+
+    /// Activation decay factor per maintenance cycle (default: 0.95)
+    /// Memories lose 5% activation each cycle: A_new = A_old * 0.95
+    pub activation_decay_factor: f32,
 }
 
 impl Default for ServerConfig {
@@ -200,6 +225,8 @@ impl Default for ServerConfig {
             max_concurrent_requests: 200,
             is_production: false,
             cors: CorsConfig::default(),
+            maintenance_interval_secs: 300, // 5 minutes
+            activation_decay_factor: 0.95,  // 5% decay per cycle
         }
     }
 }
@@ -273,6 +300,19 @@ impl ServerConfig {
         // CORS configuration
         config.cors = CorsConfig::from_env();
 
+        // Memory maintenance settings
+        if let Ok(val) = env::var("SHODH_MAINTENANCE_INTERVAL") {
+            if let Ok(n) = val.parse() {
+                config.maintenance_interval_secs = n;
+            }
+        }
+
+        if let Ok(val) = env::var("SHODH_ACTIVATION_DECAY") {
+            if let Ok(n) = val.parse::<f32>() {
+                config.activation_decay_factor = n.clamp(0.5, 0.99);
+            }
+        }
+
         config
     }
 
@@ -301,6 +341,10 @@ impl ServerConfig {
         } else {
             info!("   CORS: Permissive (all origins allowed)");
         }
+        info!(
+            "   Maintenance interval: {}s (decay factor: {:.2})",
+            self.maintenance_interval_secs, self.activation_decay_factor
+        );
     }
 }
 

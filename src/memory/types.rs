@@ -543,6 +543,10 @@ pub struct MemoryMetadata {
     pub access_count: u32,
     pub last_accessed: DateTime<Utc>,
     pub temporal_relevance: f32,
+    /// Activation level (spreading activation algorithm)
+    /// Decays over time, boosted by access and co-activation
+    /// Range: 0.0 (dormant) to 1.0 (highly active)
+    pub activation: f32,
 }
 
 impl MemoryMetadata {
@@ -554,12 +558,48 @@ impl MemoryMetadata {
     }
 }
 
+/// Entity reference - lightweight link from Memory to GraphMemory entities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityRef {
+    /// UUID of the entity in GraphMemory
+    pub entity_id: Uuid,
+    /// Entity name for quick access without graph lookup
+    pub name: String,
+    /// Relationship type (e.g., "mentioned", "subject", "location")
+    pub relation: String,
+}
+
+/// Memory tier in the cognitive hierarchy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryTier {
+    /// Active, immediate context (Cowan's focus of attention)
+    Working,
+    /// Current task/session context
+    Session,
+    /// Consolidated durable memories
+    LongTerm,
+    /// Compressed archival storage
+    Archive,
+}
+
+impl Default for MemoryTier {
+    fn default() -> Self {
+        MemoryTier::Working
+    }
+}
+
 /// Stored memory with metadata
+///
+/// This is the UNIFIED memory kernel - the single source of truth.
+/// All indices (vector, graph, temporal) are projections of this structure.
 ///
 /// Uses Arc<Mutex<MemoryMetadata>> for interior mutability, enabling updates
 /// through Arc<Memory> without cloning large embedding vectors (1.5-6KB each).
 /// This eliminates 10-100x allocation overhead on hot paths (record, retrieve).
-#[derive(Debug, Clone)]
+///
+/// Note: Clone is manually implemented to deep-copy metadata (creating a new Arc).
+/// This ensures cloned memories are fully independent.
+#[derive(Debug)]
 pub struct Memory {
     pub id: MemoryId,
     pub experience: Experience,
@@ -570,13 +610,54 @@ pub struct Memory {
     pub created_at: DateTime<Utc>,
     pub compressed: bool,
 
+    // ==========================================================================
+    // COGNITIVE EXTENSIONS - Unified memory with graph awareness
+    // ==========================================================================
+
+    /// Current tier in the memory hierarchy
+    /// Memories flow: Working → Session → LongTerm → Archive
+    pub tier: MemoryTier,
+
+    /// Entity references - bidirectional links to GraphMemory
+    /// Populated during record() via entity extraction
+    /// Enables spreading activation without graph lookup
+    pub entity_refs: Vec<EntityRef>,
+
+    /// Retrieval tracking ID - set when memory is retrieved
+    /// Used for Hebbian feedback loop (reinforce_retrieval)
+    pub last_retrieval_id: Option<Uuid>,
+
+    // ==========================================================================
     // Multi-tenancy support for enterprise deployments
+    // ==========================================================================
     pub agent_id: Option<String>,
     pub run_id: Option<String>,
     pub actor_id: Option<String>,
 
     // Similarity score (only populated in search results, not stored)
     pub score: Option<f32>,
+}
+
+impl Clone for Memory {
+    /// Deep clone that creates independent metadata.
+    /// This ensures cloned memories don't share mutable state.
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            experience: self.experience.clone(),
+            // Deep copy: create new Arc with cloned inner data
+            metadata: Arc::new(parking_lot::Mutex::new(self.metadata.lock().clone())),
+            created_at: self.created_at,
+            compressed: self.compressed,
+            tier: self.tier,
+            entity_refs: self.entity_refs.clone(),
+            last_retrieval_id: self.last_retrieval_id,
+            agent_id: self.agent_id.clone(),
+            run_id: self.run_id.clone(),
+            actor_id: self.actor_id.clone(),
+            score: self.score,
+        }
+    }
 }
 
 impl Memory {
@@ -598,14 +679,75 @@ impl Memory {
                 access_count: 0,
                 last_accessed: now,
                 temporal_relevance: 1.0,
+                activation: 1.0, // Start fully activated (just created)
             })),
             created_at: now,
             compressed: false,
+            // Cognitive extensions - initialize to defaults
+            tier: MemoryTier::Working,
+            entity_refs: Vec::new(),
+            last_retrieval_id: None,
+            // Multi-tenancy
             agent_id,
             run_id,
             actor_id,
             score: None,
         }
+    }
+
+    /// Add entity reference (bidirectional link to graph)
+    pub fn add_entity_ref(&mut self, entity_id: Uuid, name: String, relation: String) {
+        // Avoid duplicates
+        if !self.entity_refs.iter().any(|r| r.entity_id == entity_id) {
+            self.entity_refs.push(EntityRef {
+                entity_id,
+                name,
+                relation,
+            });
+        }
+    }
+
+    /// Get entity IDs for graph operations
+    pub fn entity_ids(&self) -> Vec<Uuid> {
+        self.entity_refs.iter().map(|r| r.entity_id).collect()
+    }
+
+    /// Boost activation (spreading activation algorithm, thread-safe)
+    pub fn activate(&self, amount: f32) {
+        let mut meta = self.metadata.lock();
+        meta.activation = (meta.activation + amount).min(1.0);
+    }
+
+    /// Decay activation over time (thread-safe)
+    pub fn decay_activation(&self, decay_factor: f32) {
+        self.metadata.lock().activation *= decay_factor;
+    }
+
+    /// Set retrieval tracking ID for Hebbian feedback
+    pub fn mark_retrieved(&mut self, retrieval_id: Uuid) {
+        self.last_retrieval_id = Some(retrieval_id);
+        // Also record access
+        self.record_access();
+    }
+
+    /// Promote to next tier
+    pub fn promote(&mut self) {
+        self.tier = match self.tier {
+            MemoryTier::Working => MemoryTier::Session,
+            MemoryTier::Session => MemoryTier::LongTerm,
+            MemoryTier::LongTerm => MemoryTier::Archive,
+            MemoryTier::Archive => MemoryTier::Archive, // Already at max
+        };
+    }
+
+    /// Demote to previous tier (for decay)
+    pub fn demote(&mut self) {
+        self.tier = match self.tier {
+            MemoryTier::Working => MemoryTier::Working, // Can't go lower
+            MemoryTier::Session => MemoryTier::Working,
+            MemoryTier::LongTerm => MemoryTier::Session,
+            MemoryTier::Archive => MemoryTier::LongTerm,
+        };
     }
 
     /// Get current importance (thread-safe)
@@ -628,6 +770,23 @@ impl Memory {
         self.metadata.lock().temporal_relevance
     }
 
+    /// Get activation level (thread-safe)
+    pub fn activation(&self) -> f32 {
+        self.metadata.lock().activation
+    }
+
+    /// Set activation level directly (thread-safe, clamped to [0.0, 1.0])
+    ///
+    /// Use cases:
+    /// - Data restoration from backups
+    /// - Migration from older data formats
+    /// - Testing with specific activation states
+    ///
+    /// For normal operation, prefer `activate()` (adds) and `decay_activation()` (multiplies).
+    pub fn set_activation(&self, activation: f32) {
+        self.metadata.lock().activation = activation.clamp(0.0, 1.0);
+    }
+
     /// Update access metadata (zero-copy through Arc)
     pub fn update_access(&self) {
         let mut meta = self.metadata.lock();
@@ -636,9 +795,9 @@ impl Memory {
         meta.boost_importance();
     }
 
-    /// Set importance (thread-safe)
+    /// Set importance (thread-safe, clamped to [0.0, 1.0])
     pub fn set_importance(&self, importance: f32) {
-        self.metadata.lock().importance = importance;
+        self.metadata.lock().importance = importance.clamp(0.0, 1.0);
     }
 
     /// Set temporal relevance (thread-safe)
@@ -702,6 +861,12 @@ struct MemoryFlat {
     created_at: DateTime<Utc>,
     last_accessed: DateTime<Utc>,
     compressed: bool,
+    // Cognitive extensions
+    tier: MemoryTier,
+    entity_refs: Vec<EntityRef>,
+    activation: f32,
+    last_retrieval_id: Option<Uuid>,
+    // Multi-tenancy
     agent_id: Option<String>,
     run_id: Option<String>,
     actor_id: Option<String>,
@@ -724,6 +889,12 @@ impl Serialize for Memory {
             created_at: self.created_at,
             last_accessed: meta.last_accessed,
             compressed: self.compressed,
+            // Cognitive extensions
+            tier: self.tier,
+            entity_refs: self.entity_refs.clone(),
+            activation: meta.activation,
+            last_retrieval_id: self.last_retrieval_id,
+            // Multi-tenancy
             agent_id: self.agent_id.clone(),
             run_id: self.run_id.clone(),
             actor_id: self.actor_id.clone(),
@@ -749,9 +920,15 @@ impl<'de> Deserialize<'de> for Memory {
                 access_count: flat.access_count,
                 last_accessed: flat.last_accessed,
                 temporal_relevance: flat.temporal_relevance,
+                activation: flat.activation,
             })),
             created_at: flat.created_at,
             compressed: flat.compressed,
+            // Cognitive extensions
+            tier: flat.tier,
+            entity_refs: flat.entity_refs,
+            last_retrieval_id: flat.last_retrieval_id,
+            // Multi-tenancy
             agent_id: flat.agent_id,
             run_id: flat.run_id,
             actor_id: flat.actor_id,

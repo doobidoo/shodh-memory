@@ -1038,11 +1038,24 @@ impl MemoryGraph {
     }
 
     /// Record co-access of memories (strengthens their connection)
+    ///
+    /// Note: For large retrievals, we limit to top N memories to avoid O(n²) explosion.
+    /// This is a deliberate tradeoff: we still get good association learning while
+    /// keeping worst-case complexity bounded to O(MAX_COACTIVATION_SIZE²).
     pub(crate) fn record_coactivation(&mut self, memories: &[MemoryId]) {
+        const MAX_COACTIVATION_SIZE: usize = 20;
+
+        // Limit to top N memories to bound worst-case O(n²) to O(400)
+        let memories_to_process = if memories.len() > MAX_COACTIVATION_SIZE {
+            &memories[..MAX_COACTIVATION_SIZE]
+        } else {
+            memories
+        };
+
         // Strengthen edges between all pairs of co-accessed memories
-        for i in 0..memories.len() {
-            for j in (i + 1)..memories.len() {
-                self.add_edge(&memories[i], &memories[j]);
+        for i in 0..memories_to_process.len() {
+            for j in (i + 1)..memories_to_process.len() {
+                self.add_edge(&memories_to_process[i], &memories_to_process[j]);
             }
         }
     }

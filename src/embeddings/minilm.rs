@@ -423,14 +423,30 @@ impl MiniLMEmbedder {
     }
 
     /// L2 normalize embedding
-    fn normalize(&self, embedding: &mut [f32]) {
-        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        if norm > 0.0 {
-            for val in embedding {
-                *val /= norm;
+    /// Returns false if normalization failed (zero norm or NaN detected)
+    fn normalize(&self, embedding: &mut [f32]) -> bool {
+        // Check for NaN values before normalization
+        if embedding.iter().any(|x| x.is_nan() || x.is_infinite()) {
+            // Replace invalid values with zero
+            for val in embedding.iter_mut() {
+                if val.is_nan() || val.is_infinite() {
+                    *val = 0.0;
+                }
             }
         }
+
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        // Handle zero norm (all zeros) or NaN norm
+        if norm.is_nan() || norm < f32::EPSILON {
+            return false;
+        }
+
+        for val in embedding.iter_mut() {
+            *val /= norm;
+        }
+
+        true
     }
 
     /// Generate embedding using simplified approach
@@ -475,8 +491,8 @@ impl MiniLMEmbedder {
             }
         }
 
-        // Normalize
-        self.normalize(&mut embedding);
+        // Normalize - if normalization fails (empty text), return zero vector
+        let _ = self.normalize(&mut embedding);
 
         Ok(embedding)
     }
@@ -549,8 +565,15 @@ impl MiniLMEmbedder {
             }
         }
 
+        // Handle NaN/Inf values that may come from model output
+        for val in pooled.iter_mut() {
+            if val.is_nan() || val.is_infinite() {
+                *val = 0.0;
+            }
+        }
+
         let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
+        if norm > f32::EPSILON && !norm.is_nan() {
             for val in &mut pooled {
                 *val /= norm;
             }
@@ -658,9 +681,16 @@ impl MiniLMEmbedder {
                 }
             }
 
+            // Handle NaN/Inf values
+            for val in pooled.iter_mut() {
+                if val.is_nan() || val.is_infinite() {
+                    *val = 0.0;
+                }
+            }
+
             // L2 normalize
             let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
+            if norm > f32::EPSILON && !norm.is_nan() {
                 for val in &mut pooled {
                     *val /= norm;
                 }

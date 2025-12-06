@@ -646,6 +646,195 @@ class Memory:
         _handle_response_error(response, context="export graph")
         return response.text
 
+    def recall(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> List[dict]:
+        """Semantic search - find memories similar to the query
+
+        This is the primary retrieval method using vector similarity search.
+        Use this for natural language queries like "What did we decide about X?"
+
+        Args:
+            query: Natural language search query
+            limit: Maximum number of results (default: 5)
+
+        Returns:
+            List of matching memories with similarity scores
+
+        Examples:
+            # Find memories about Python
+            results = memory.recall("Python programming decisions")
+
+            # Get more results
+            results = memory.recall("error handling patterns", limit=10)
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/retrieve",
+                json={
+                    "user_id": self.user_id,
+                    "query": query,
+                    "limit": limit
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+        except requests.exceptions.Timeout as e:
+            raise ShodhError(f"Request timed out: {e}") from e
+
+        _handle_response_error(response, context="recall")
+        return response.json()["memories"]
+
+    def remember(
+        self,
+        content: str,
+        memory_type: str = "Observation",
+        tags: Optional[List[str]] = None
+    ) -> str:
+        """Store a memory (alias for add with simplified interface)
+
+        This is the primary storage method for LLM agents.
+
+        Args:
+            content: The content to remember
+            memory_type: One of: Observation, Decision, Learning, Error,
+                        Discovery, Pattern, Context, Task
+            tags: Optional tags for categorization
+
+        Returns:
+            Memory ID
+
+        Examples:
+            # Store a decision
+            memory.remember("Use PostgreSQL for the database", memory_type="Decision")
+
+            # Store a learning
+            memory.remember("Async/await is faster than threads for I/O",
+                          memory_type="Learning",
+                          tags=["python", "performance"])
+        """
+        return self.add(
+            content=content,
+            experience_type=memory_type,
+            metadata={"tags": ",".join(tags)} if tags else {}
+        )
+
+    def context_summary(
+        self,
+        include_decisions: bool = True,
+        include_learnings: bool = True,
+        include_context: bool = True,
+        max_items: int = 5
+    ) -> dict:
+        """Get a condensed summary of recent learnings, decisions, and context
+
+        Use this at the start of a session to quickly understand what
+        you've learned before. Returns memories organized by type.
+
+        Args:
+            include_decisions: Include recent decisions (default: True)
+            include_learnings: Include recent learnings (default: True)
+            include_context: Include project context (default: True)
+            max_items: Maximum items per category (default: 5)
+
+        Returns:
+            Dict with categorized memories:
+            {
+                "total_memories": 42,
+                "context": [...],
+                "decisions": [...],
+                "learnings": [...],
+                "patterns": [...],
+                "errors": [...]
+            }
+
+        Examples:
+            # Get full context summary
+            summary = memory.context_summary()
+            print(f"Total: {summary['total_memories']} memories")
+            for decision in summary['decisions']:
+                print(f"  - {decision['content'][:80]}")
+
+            # Just get decisions
+            summary = memory.context_summary(
+                include_learnings=False,
+                include_context=False
+            )
+        """
+        # Fetch all memories
+        memories = self.get_all(limit=500)
+
+        # Categorize by type
+        context = []
+        decisions = []
+        learnings = []
+        patterns = []
+        errors = []
+
+        for m in memories:
+            exp = m.get("experience", {})
+            exp_type = exp.get("experience_type", "Observation")
+            content = exp.get("content", "")
+
+            item = {
+                "id": m.get("id", ""),
+                "content": content,
+                "created_at": m.get("created_at", "")
+            }
+
+            if exp_type == "Context" and include_context:
+                context.append(item)
+            elif exp_type == "Decision" and include_decisions:
+                decisions.append(item)
+            elif exp_type == "Learning" and include_learnings:
+                learnings.append(item)
+            elif exp_type == "Pattern":
+                patterns.append(item)
+            elif exp_type == "Error":
+                errors.append(item)
+
+        return {
+            "total_memories": len(memories),
+            "context": context[:max_items],
+            "decisions": decisions[:max_items],
+            "learnings": learnings[:max_items],
+            "patterns": patterns[:max_items],
+            "errors": errors[:min(3, max_items)]  # Limit errors
+        }
+
+    def brain_state(self) -> dict:
+        """Get brain state visualization data
+
+        Returns memories organized by cognitive tier (working, session, long-term)
+        with activation levels.
+
+        Returns:
+            Dict with:
+            {
+                "working_memory": [...],
+                "session_memory": [...],
+                "longterm_memory": [...],
+                "stats": {
+                    "total_memories": 42,
+                    "avg_activation": 0.65,
+                    ...
+                }
+            }
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/api/brain/{self.user_id}",
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="brain state")
+        return response.json()
+
     def __enter__(self):
         """Context manager support"""
         return self

@@ -499,6 +499,29 @@
             </div>
 
             <div class="section">
+                <div class="section-title">Brain State</div>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-value" id="workingCount">0</div>
+                        <div class="stat-label">Working</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="sessionCount">0</div>
+                        <div class="stat-label">Session</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="longtermCount">0</div>
+                        <div class="stat-label">Long-term</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="avgActivation">0%</div>
+                        <div class="stat-label">Activation</div>
+                    </div>
+                </div>
+                <button class="btn btn-secondary" onclick="fetchBrainState()">Refresh Brain</button>
+            </div>
+
+            <div class="section">
                 <div class="section-title">Quick Test</div>
                 <div class="input-group">
                     <label>Content</label>
@@ -541,6 +564,8 @@
         let eventCounter = 0;
         let reconnectCount = 0;
         let totalMemories = 0;
+        let brainState = null; // Stores current brain state for visualization
+        let brainNeurons = []; // Persistent neurons for brain visualization
 
         // Canvas setup
         function initCanvas() {
@@ -627,6 +652,67 @@
             }
         }
 
+        // Brain Neuron class for persistent memory visualization
+        class BrainNeuron {
+            constructor(memory, tier, index, total) {
+                this.id = memory.id;
+                this.content = memory.content_preview;
+                this.activation = memory.activation;
+                this.importance = memory.importance;
+                this.tier = tier;
+
+                // Position based on tier (working=top, session=middle, longterm=bottom)
+                const tierY = tier === 'working' ? 0.2 : tier === 'session' ? 0.5 : 0.8;
+                const spread = Math.min(total, 20);
+                const xOffset = (index % spread) / spread;
+
+                this.x = 50 + xOffset * (canvas.width - 100);
+                this.y = tierY * canvas.height + (Math.random() - 0.5) * 60;
+                this.targetX = this.x;
+                this.targetY = this.y;
+                this.size = 4 + this.importance * 8;
+                this.pulsePhase = Math.random() * Math.PI * 2;
+
+                // Color based on tier
+                this.color = tier === 'working' ? '#00e676' :
+                            tier === 'session' ? '#ffab40' : '#448aff';
+            }
+
+            update() {
+                // Gentle floating based on activation
+                const floatAmount = this.activation * 3;
+                this.x = this.targetX + Math.sin(Date.now() * 0.001 + this.pulsePhase) * floatAmount;
+                this.y = this.targetY + Math.cos(Date.now() * 0.0008 + this.pulsePhase) * floatAmount;
+            }
+
+            draw() {
+                // Glow based on activation
+                const glowSize = this.size * (1 + this.activation);
+                const gradient = ctx.createRadialGradient(
+                    this.x, this.y, 0,
+                    this.x, this.y, glowSize * 2
+                );
+                gradient.addColorStop(0, this.color);
+                gradient.addColorStop(0.3, this.color + Math.floor(this.activation * 128).toString(16).padStart(2, '0'));
+                gradient.addColorStop(1, 'transparent');
+
+                ctx.globalAlpha = 0.3 + this.activation * 0.7;
+                ctx.fillStyle = gradient;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, glowSize * 2, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Core with pulse
+                const pulseScale = 0.9 + 0.1 * Math.sin(Date.now() * 0.003 + this.pulsePhase);
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size * pulseScale, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.globalAlpha = 1;
+            }
+        }
+
         // Connection animation between particles
         function drawConnections() {
             ctx.strokeStyle = 'rgba(100, 255, 218, 0.1)';
@@ -675,7 +761,43 @@
             // Update and draw connections
             drawConnections();
 
-            // Update and draw particles
+            // Draw tier labels if brain neurons exist
+            if (brainNeurons.length > 0) {
+                ctx.fillStyle = 'rgba(100, 255, 218, 0.5)';
+                ctx.font = '11px Inter, sans-serif';
+                ctx.textAlign = 'left';
+                ctx.fillText('WORKING MEMORY', 10, canvas.height * 0.2 - 30);
+                ctx.fillStyle = 'rgba(255, 171, 64, 0.5)';
+                ctx.fillText('SESSION MEMORY', 10, canvas.height * 0.5 - 30);
+                ctx.fillStyle = 'rgba(68, 138, 255, 0.5)';
+                ctx.fillText('LONG-TERM MEMORY', 10, canvas.height * 0.8 - 30);
+            }
+
+            // Update and draw brain neurons (persistent)
+            for (const neuron of brainNeurons) {
+                neuron.update();
+                neuron.draw();
+            }
+
+            // Draw connections between brain neurons
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i < brainNeurons.length; i++) {
+                for (let j = i + 1; j < brainNeurons.length; j++) {
+                    const dx = brainNeurons[i].x - brainNeurons[j].x;
+                    const dy = brainNeurons[i].y - brainNeurons[j].y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < 100) {
+                        const alpha = (1 - dist / 100) * 0.15 * brainNeurons[i].activation * brainNeurons[j].activation;
+                        ctx.strokeStyle = `rgba(100, 255, 218, ${alpha})`;
+                        ctx.beginPath();
+                        ctx.moveTo(brainNeurons[i].x, brainNeurons[i].y);
+                        ctx.lineTo(brainNeurons[j].x, brainNeurons[j].y);
+                        ctx.stroke();
+                    }
+                }
+            }
+
+            // Update and draw particles (transient events)
             particles = particles.filter(p => {
                 const alive = p.update();
                 if (alive) p.draw();
@@ -833,6 +955,57 @@
             document.getElementById('sseStatus').style.color = 'var(--text-muted)';
         }
 
+        // Fetch brain state visualization
+        async function fetchBrainState() {
+            const userId = document.getElementById('userId').value.trim();
+            if (!userId) {
+                addActivity('access', 'Please enter a User ID first');
+                return;
+            }
+
+            try {
+                const res = await fetch(`${API}/api/brain/${encodeURIComponent(userId)}`, {
+                    headers: { 'X-API-Key': KEY }
+                });
+
+                if (!res.ok) {
+                    addActivity('access', `Brain state fetch failed: ${res.status}`);
+                    return;
+                }
+
+                const data = await res.json();
+                brainState = data;
+
+                // Update stats display
+                document.getElementById('workingCount').textContent = data.stats.working_count;
+                document.getElementById('sessionCount').textContent = data.stats.session_count;
+                document.getElementById('longtermCount').textContent = data.stats.longterm_count;
+                document.getElementById('avgActivation').textContent =
+                    (data.stats.avg_activation * 100).toFixed(0) + '%';
+
+                // Build brain neurons for visualization
+                brainNeurons = [];
+
+                data.working_memory.forEach((mem, i) => {
+                    brainNeurons.push(new BrainNeuron(mem, 'working', i, data.working_memory.length));
+                });
+
+                data.session_memory.forEach((mem, i) => {
+                    brainNeurons.push(new BrainNeuron(mem, 'session', i, data.session_memory.length));
+                });
+
+                data.longterm_memory.forEach((mem, i) => {
+                    brainNeurons.push(new BrainNeuron(mem, 'longterm', i, data.longterm_memory.length));
+                });
+
+                addActivity('access', `Brain state loaded: ${data.stats.total_memories} memories across 3 tiers`);
+
+            } catch (e) {
+                console.error('Brain state fetch error:', e);
+                addActivity('access', `Brain state error: ${e.message}`);
+            }
+        }
+
         // Check health
         async function checkHealth() {
             try {
@@ -854,6 +1027,9 @@
 
             // Get initial memory count (one-time fetch)
             fetchInitialStats();
+
+            // Fetch brain state visualization
+            fetchBrainState();
 
             // Connect to SSE stream
             connectSSE();
