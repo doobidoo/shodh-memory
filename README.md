@@ -5,10 +5,12 @@
 <h1 align="center">Shodh-Memory</h1>
 
 <p align="center">
+  <a href="https://github.com/varun29ankuS/shodh-memory/actions"><img src="https://github.com/varun29ankuS/shodh-memory/workflows/CI/badge.svg" alt="CI"></a>
   <a href="https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory"><img src="https://img.shields.io/badge/MCP-Registry-green" alt="MCP Registry"></a>
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
-  <a href="https://pepy.tech/project/shodh-memory"><img src="https://static.pepy.tech/badge/shodh-memory" alt="Downloads"></a>
+  <a href="https://pepy.tech/project/shodh-memory"><img src="https://static.pepy.tech/badge/shodh-memory" alt="PyPI Downloads"></a>
+  <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/dm/@shodh/memory-mcp.svg?label=npm%20downloads" alt="npm Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 
