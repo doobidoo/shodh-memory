@@ -2,9 +2,14 @@
 name = "shodh-memory"
 version = "0.1.2"
 edition = "2021"
-authors = ["shodh-rag"]
-description = "Shodh-Memory - Offline, user-isolated memory layer for AI agents"
+authors = ["Shodh Team <29.varuns@gmail.com>"]
+description = "Cognitive memory system for AI agents - Hebbian learning, activation decay, semantic consolidation in a single binary"
 license = "Apache-2.0"
+repository = "https://github.com/varun29ankuS/shodh-memory"
+homepage = "https://github.com/varun29ankuS/shodh-memory"
+readme = "README.md"
+keywords = ["memory", "ai", "llm", "embedding", "cognitive"]
+categories = ["science", "database", "embedded"]
 
 [lib]
 name = "shodh_memory"
