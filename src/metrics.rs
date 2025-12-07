@@ -282,6 +282,79 @@ lazy_static! {
             "Number of queued requests"
         ).expect("REQUEST_QUEUE_SIZE metric must be valid at compile time")
     };
+
+    // ============================================================================
+    // Hebbian Learning Metrics
+    // ============================================================================
+
+    /// Hebbian reinforcement operations
+    pub static ref HEBBIAN_REINFORCE_TOTAL: IntCounterVec = {
+        IntCounterVec::new(
+            Opts::new("shodh_hebbian_reinforce_total", "Total Hebbian reinforcement operations"),
+            &["outcome", "result"]  // outcome: "helpful", "misleading", "neutral"
+        ).expect("HEBBIAN_REINFORCE_TOTAL metric must be valid at compile time")
+    };
+
+    /// Hebbian reinforcement duration
+    pub static ref HEBBIAN_REINFORCE_DURATION: HistogramVec = {
+        HistogramVec::new(
+            HistogramOpts::new(
+                "shodh_hebbian_reinforce_duration_seconds",
+                "Hebbian reinforcement operation duration"
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
+            &["outcome"]
+        ).expect("HEBBIAN_REINFORCE_DURATION metric must be valid at compile time")
+    };
+
+    // ============================================================================
+    // Consolidation Metrics
+    // ============================================================================
+
+    /// Memory consolidation operations
+    pub static ref CONSOLIDATE_TOTAL: IntCounterVec = {
+        IntCounterVec::new(
+            Opts::new("shodh_consolidate_total", "Total memory consolidation operations"),
+            &["result"]
+        ).expect("CONSOLIDATE_TOTAL metric must be valid at compile time")
+    };
+
+    /// Memory consolidation duration
+    pub static ref CONSOLIDATE_DURATION: Histogram = {
+        Histogram::with_opts(
+            HistogramOpts::new(
+                "shodh_consolidate_duration_seconds",
+                "Memory consolidation operation duration"
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+        ).expect("CONSOLIDATE_DURATION metric must be valid at compile time")
+    };
+
+    // ============================================================================
+    // Batch Operation Metrics
+    // ============================================================================
+
+    /// Batch store duration
+    pub static ref BATCH_STORE_DURATION: Histogram = {
+        Histogram::with_opts(
+            HistogramOpts::new(
+                "shodh_batch_store_duration_seconds",
+                "Batch memory store operation duration"
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0])
+        ).expect("BATCH_STORE_DURATION metric must be valid at compile time")
+    };
+
+    /// Batch store size
+    pub static ref BATCH_STORE_SIZE: Histogram = {
+        Histogram::with_opts(
+            HistogramOpts::new(
+                "shodh_batch_store_size",
+                "Number of memories in batch store operations"
+            )
+            .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0])
+        ).expect("BATCH_STORE_SIZE metric must be valid at compile time")
+    };
 }
 
 /// Register all metrics with the global registry
@@ -354,6 +427,18 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Concurrency metrics
     register!(CONCURRENT_REQUESTS, "CONCURRENT_REQUESTS");
     register!(REQUEST_QUEUE_SIZE, "REQUEST_QUEUE_SIZE");
+
+    // Hebbian learning metrics
+    register!(HEBBIAN_REINFORCE_TOTAL, "HEBBIAN_REINFORCE_TOTAL");
+    register!(HEBBIAN_REINFORCE_DURATION, "HEBBIAN_REINFORCE_DURATION");
+
+    // Consolidation metrics
+    register!(CONSOLIDATE_TOTAL, "CONSOLIDATE_TOTAL");
+    register!(CONSOLIDATE_DURATION, "CONSOLIDATE_DURATION");
+
+    // Batch operation metrics
+    register!(BATCH_STORE_DURATION, "BATCH_STORE_DURATION");
+    register!(BATCH_STORE_SIZE, "BATCH_STORE_SIZE");
 
     if errors.is_empty() {
         Ok(())

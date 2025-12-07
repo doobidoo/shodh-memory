@@ -565,6 +565,22 @@ impl MemorySystem {
                 // Remove memories matching pattern
                 self.forget_by_pattern(&pattern)?
             }
+            ForgetCriteria::ByTags(tags) => {
+                // Remove memories matching ANY of the specified tags
+                self.forget_by_tags(&tags)?
+            }
+            ForgetCriteria::ByDateRange { start, end } => {
+                // Remove memories within the date range
+                self.forget_by_date_range(start, end)?
+            }
+            ForgetCriteria::ByType(exp_type) => {
+                // Remove memories of a specific type
+                self.forget_by_type(exp_type)?
+            }
+            ForgetCriteria::All => {
+                // GDPR: Clear ALL memories for the user
+                self.forget_all()?
+            }
         };
 
         Ok(forgotten_count)
@@ -1015,6 +1031,184 @@ impl MemorySystem {
         count += self.working_memory.write().remove_matching(&regex)?;
         count += self.session_memory.write().remove_matching(&regex)?;
         count += self.long_term_memory.remove_matching(&regex)?;
+
+        Ok(count)
+    }
+
+    /// Forget memories matching ANY of the specified tags
+    fn forget_by_tags(&self, tags: &[String]) -> Result<usize> {
+        let mut count = 0;
+
+        // Remove from working memory
+        {
+            let mut working = self.working_memory.write();
+            let ids_to_remove: Vec<MemoryId> = working
+                .all_memories()
+                .iter()
+                .filter(|m| m.experience.entities.iter().any(|e| tags.contains(e)))
+                .map(|m| m.id.clone())
+                .collect();
+            for id in &ids_to_remove {
+                working.remove(id);
+                count += 1;
+            }
+        }
+
+        // Remove from session memory
+        {
+            let mut session = self.session_memory.write();
+            let ids_to_remove: Vec<MemoryId> = session
+                .all_memories()
+                .iter()
+                .filter(|m| m.experience.entities.iter().any(|e| tags.contains(e)))
+                .map(|m| m.id.clone())
+                .collect();
+            for id in &ids_to_remove {
+                session.remove(id);
+                count += 1;
+            }
+        }
+
+        // Remove from long-term memory (hard delete for tag-based)
+        let all_lt = self.long_term_memory.get_all()?;
+        for memory in all_lt {
+            if memory.experience.entities.iter().any(|e| tags.contains(e)) {
+                self.long_term_memory.delete(&memory.id)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Forget memories within a date range (inclusive)
+    fn forget_by_date_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let mut count = 0;
+
+        // Remove from working memory
+        {
+            let mut working = self.working_memory.write();
+            let ids_to_remove: Vec<MemoryId> = working
+                .all_memories()
+                .iter()
+                .filter(|m| m.created_at >= start && m.created_at <= end)
+                .map(|m| m.id.clone())
+                .collect();
+            for id in &ids_to_remove {
+                working.remove(id);
+                count += 1;
+            }
+        }
+
+        // Remove from session memory
+        {
+            let mut session = self.session_memory.write();
+            let ids_to_remove: Vec<MemoryId> = session
+                .all_memories()
+                .iter()
+                .filter(|m| m.created_at >= start && m.created_at <= end)
+                .map(|m| m.id.clone())
+                .collect();
+            for id in &ids_to_remove {
+                session.remove(id);
+                count += 1;
+            }
+        }
+
+        // Remove from long-term memory using storage search
+        let memories = self.long_term_memory.search(storage::SearchCriteria::ByDate {
+            start,
+            end,
+        })?;
+        for memory in memories {
+            self.long_term_memory.delete(&memory.id)?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Forget memories of a specific type
+    fn forget_by_type(&self, exp_type: ExperienceType) -> Result<usize> {
+        let mut count = 0;
+
+        // Remove from working memory
+        {
+            let mut working = self.working_memory.write();
+            let ids_to_remove: Vec<MemoryId> = working
+                .all_memories()
+                .iter()
+                .filter(|m| m.experience.experience_type == exp_type)
+                .map(|m| m.id.clone())
+                .collect();
+            for id in &ids_to_remove {
+                working.remove(id);
+                count += 1;
+            }
+        }
+
+        // Remove from session memory
+        {
+            let mut session = self.session_memory.write();
+            let ids_to_remove: Vec<MemoryId> = session
+                .all_memories()
+                .iter()
+                .filter(|m| m.experience.experience_type == exp_type)
+                .map(|m| m.id.clone())
+                .collect();
+            for id in &ids_to_remove {
+                session.remove(id);
+                count += 1;
+            }
+        }
+
+        // Remove from long-term memory using storage search
+        let memories = self
+            .long_term_memory
+            .search(storage::SearchCriteria::ByType(exp_type))?;
+        for memory in memories {
+            self.long_term_memory.delete(&memory.id)?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Forget ALL memories for a user (GDPR compliance - right to erasure)
+    ///
+    /// WARNING: This is a destructive operation. All memories across all tiers
+    /// will be permanently deleted. This cannot be undone.
+    fn forget_all(&self) -> Result<usize> {
+        let mut count = 0;
+
+        // Clear working memory
+        {
+            let mut working = self.working_memory.write();
+            count += working.len();
+            working.clear();
+        }
+
+        // Clear session memory
+        {
+            let mut session = self.session_memory.write();
+            count += session.len();
+            session.clear();
+        }
+
+        // Clear all from long-term memory (hard delete)
+        let all_lt = self.long_term_memory.get_all()?;
+        for memory in all_lt {
+            self.long_term_memory.delete(&memory.id)?;
+            count += 1;
+        }
+
+        // Note: Vector index is NOT cleared here - it will be rebuilt on next use
+        // when rebuild_vector_index() is called. This is acceptable for GDPR
+        // compliance since the source data (storage) is deleted.
 
         Ok(count)
     }

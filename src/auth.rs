@@ -72,7 +72,7 @@ pub fn validate_api_key(provided_key: &str) -> Result<(), AuthError> {
 
             // Development mode: warn but allow default key
             tracing::warn!("SHODH_API_KEYS not set - using development key (not for production!)");
-            "shodh-dev-key-change-in-production".to_string()
+            "sk-shodh-dev-4f8b2c1d9e3a7f5b6d2c8e4a1b9f7d3c".to_string()
         }
     };
 

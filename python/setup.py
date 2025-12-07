@@ -4,12 +4,12 @@ from setuptools import setup, find_packages
 from pathlib import Path
 
 # Read README
-readme_file = Path(__file__).parent.parent / "README.md"
+readme_file = Path(__file__).parent / "README.md"
 long_description = readme_file.read_text() if readme_file.exists() else ""
 
 setup(
     name="shodh-memory",
-    version="0.1.3",
+    version="0.1.3.post2",
     author="Shodh Team",
     author_email="29.varuns@gmail.com",
     description="Cognitive memory system for AI agents - biological memory processing in a single binary",

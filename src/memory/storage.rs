@@ -10,12 +10,37 @@ use std::sync::Arc;
 
 use super::types::*;
 
+/// Write mode for storage operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Sync writes - fsync() on every write (durable but slow: 2-10ms per write)
+    /// Use for: shutdown, critical data, compliance requirements
+    Sync,
+    /// Async writes - no fsync(), data buffered in OS page cache (fast: <1ms per write)
+    /// Use for: robotics, edge, high-throughput scenarios
+    /// Data survives process crashes but NOT power loss before next fsync
+    Async,
+}
+
+impl Default for WriteMode {
+    fn default() -> Self {
+        // Default to async for robotics-grade latency
+        // Override with SHODH_WRITE_MODE=sync for durability-critical deployments
+        match std::env::var("SHODH_WRITE_MODE") {
+            Ok(mode) if mode.to_lowercase() == "sync" => WriteMode::Sync,
+            _ => WriteMode::Async,
+        }
+    }
+}
+
 /// Storage engine for long-term memory persistence
 pub struct MemoryStorage {
     db: Arc<DB>,
     index_db: Arc<DB>, // Secondary indices
     /// Base storage path for all memory data
     storage_path: PathBuf,
+    /// Write mode (sync vs async) - affects latency vs durability tradeoff
+    write_mode: WriteMode,
 }
 
 impl MemoryStorage {
@@ -68,10 +93,22 @@ impl MemoryStorage {
         let index_path = path.join("memory_index");
         let index_db = Arc::new(DB::open(&opts, index_path)?);
 
+        let write_mode = WriteMode::default();
+        tracing::info!(
+            "Storage initialized with {:?} write mode (latency: {})",
+            write_mode,
+            if write_mode == WriteMode::Sync {
+                "2-10ms per write"
+            } else {
+                "<1ms per write"
+            }
+        );
+
         Ok(Self {
             db,
             index_db,
             storage_path: path.to_path_buf(),
+            write_mode,
         })
     }
 
@@ -80,11 +117,14 @@ impl MemoryStorage {
         &self.storage_path
     }
 
-    /// Store a memory with durable write (WAL sync)
+    /// Store a memory with configurable write durability
     ///
-    /// PRODUCTION: Uses sync writes to ensure data survives crashes/restarts.
-    /// The sync flag causes RocksDB to fsync() the WAL before returning,
-    /// guaranteeing the write is on stable storage.
+    /// ROBOTICS OPTIMIZATION: Write mode is configurable via SHODH_WRITE_MODE env var.
+    /// - Async (default): <1ms per write, data survives process crashes
+    /// - Sync: 2-10ms per write, data survives power loss
+    ///
+    /// For robotics/edge: Use async mode + periodic flush() calls for best latency.
+    /// For compliance/critical: Set SHODH_WRITE_MODE=sync for full durability.
     pub fn store(&self, memory: &Memory) -> Result<()> {
         let key = memory.id.0.as_bytes();
 
@@ -92,18 +132,16 @@ impl MemoryStorage {
         let value = bincode::serialize(memory)
             .context(format!("Failed to serialize memory {}", memory.id.0))?;
 
-        // DURABILITY: Use sync writes to ensure data persists across restarts
-        // This is the fundamental fix - without sync, data stays in OS page cache
-        // and can be lost if process exits before fsync
+        // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true); // fsync() WAL before returning
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
 
-        // Store in main database with sync
+        // Store in main database
         self.db
             .put_opt(key, &value, &write_opts)
             .context(format!("Failed to put memory {} in RocksDB", memory.id.0))?;
 
-        // Update indices (also with sync for consistency)
+        // Update indices
         self.update_indices(memory)?;
 
         Ok(())
@@ -184,9 +222,9 @@ impl MemoryStorage {
             batch.put(reward_key.as_bytes(), b"1");
         }
 
-        // DURABILITY: Sync write for index consistency
+        // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.index_db.write_opt(batch, &write_opts)?;
         Ok(())
     }
@@ -218,14 +256,14 @@ impl MemoryStorage {
         self.store(memory)
     }
 
-    /// Delete a memory with durable write
+    /// Delete a memory with configurable durability
     #[allow(unused)] // Public API - available for memory management
     pub fn delete(&self, id: &MemoryId) -> Result<()> {
         let key = id.0.as_bytes();
 
-        // DURABILITY: Sync write for delete operations
+        // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.db.delete_opt(key, &write_opts)?;
 
         // Clean up indices
@@ -302,9 +340,9 @@ impl MemoryStorage {
             batch.delete(reward_key.as_bytes());
         }
 
-        // DURABILITY: Sync write for index consistency
+        // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.index_db.write_opt(batch, &write_opts)?;
         Ok(())
     }
@@ -326,6 +364,9 @@ impl MemoryStorage {
             }
             SearchCriteria::ByEntity(entity) => {
                 memory_ids = self.search_by_entity(&entity)?;
+            }
+            SearchCriteria::ByTags(tags) => {
+                memory_ids = self.search_by_tags(&tags)?;
             }
 
             // === Robotics Criteria ===
@@ -495,6 +536,35 @@ impl MemoryStorage {
         }
 
         Ok(ids)
+    }
+
+    /// Search memories by tags (returns memories matching ANY of the provided tags)
+    fn search_by_tags(&self, tags: &[String]) -> Result<Vec<MemoryId>> {
+        use std::collections::HashSet;
+
+        // Union of all tag matches
+        let mut all_ids = HashSet::new();
+
+        for tag in tags {
+            let prefix = format!("entity:{tag}:");
+            let iter = self.index_db.iterator(IteratorMode::From(
+                prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ));
+            for (key, _) in iter.flatten() {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                if let Some(id_str) = key_str.strip_prefix(&prefix) {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+                        all_ids.insert(MemoryId(uuid));
+                    }
+                }
+            }
+        }
+
+        Ok(all_ids.into_iter().collect())
     }
 
     // ========================================================================
@@ -877,6 +947,8 @@ pub enum SearchCriteria {
         max: f32,
     },
     ByEntity(String),
+    /// Filter by tags (matches memories containing ANY of these tags)
+    ByTags(Vec<String>),
 
     // === Robotics Criteria ===
     /// Filter by robot/drone identifier

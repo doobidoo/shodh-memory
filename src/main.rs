@@ -1258,6 +1258,9 @@ async fn remember(
     State(state): State<AppState>,
     Json(req): Json<RememberRequest>,
 ) -> Result<Json<RememberResponse>, AppError> {
+    // P1.2: Instrument remember operation
+    let op_start = std::time::Instant::now();
+
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
 
@@ -1300,6 +1303,13 @@ async fn remember(
         .map_err(AppError::Internal)?
     };
 
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    metrics::MEMORY_STORE_DURATION.observe(duration);
+    metrics::MEMORY_STORE_TOTAL
+        .with_label_values(&["success"])
+        .inc();
+
     Ok(Json(RememberResponse {
         id: memory_id.0.to_string(),
         success: true,
@@ -1313,6 +1323,9 @@ async fn recall(
     State(state): State<AppState>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<RecallResponse>, AppError> {
+    // P1.2: Instrument recall operation
+    let op_start = std::time::Instant::now();
+
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -1349,6 +1362,19 @@ async fn recall(
         .collect();
 
     let count = recall_memories.len();
+
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    metrics::MEMORY_RETRIEVE_DURATION
+        .with_label_values(&["semantic"])
+        .observe(duration);
+    metrics::MEMORY_RETRIEVE_TOTAL
+        .with_label_values(&["semantic", "success"])
+        .inc();
+    metrics::MEMORY_RETRIEVE_RESULTS
+        .with_label_values(&["semantic"])
+        .observe(count as f64);
+
     Ok(Json(RecallResponse {
         memories: recall_memories,
         count,
@@ -1369,6 +1395,7 @@ async fn retrieve_tracked(
     State(state): State<AppState>,
     Json(req): Json<TrackedRetrieveRequest>,
 ) -> Result<Json<TrackedRetrieveResponse>, AppError> {
+    let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -1410,6 +1437,20 @@ async fn retrieve_tracked(
         })
         .collect();
 
+    let count = recall_memories.len();
+
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    metrics::MEMORY_RETRIEVE_DURATION
+        .with_label_values(&["tracked"])
+        .observe(duration);
+    metrics::MEMORY_RETRIEVE_TOTAL
+        .with_label_values(&["tracked", "success"])
+        .inc();
+    metrics::MEMORY_RETRIEVE_RESULTS
+        .with_label_values(&["tracked"])
+        .observe(count as f64);
+
     Ok(Json(TrackedRetrieveResponse {
         tracking_id,
         memory_ids,
@@ -1429,6 +1470,8 @@ async fn reinforce_feedback(
     State(state): State<AppState>,
     Json(req): Json<ReinforceFeedbackRequest>,
 ) -> Result<Json<ReinforceFeedbackResponse>, AppError> {
+    let op_start = std::time::Instant::now();
+
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     if req.memory_ids.is_empty() {
@@ -1441,7 +1484,8 @@ async fn reinforce_feedback(
     }
 
     // Parse outcome
-    let outcome = match req.outcome.to_lowercase().as_str() {
+    let outcome_label = req.outcome.to_lowercase();
+    let outcome = match outcome_label.as_str() {
         "helpful" => crate::memory::RetrievalOutcome::Helpful,
         "misleading" => crate::memory::RetrievalOutcome::Misleading,
         "neutral" | _ => crate::memory::RetrievalOutcome::Neutral,
@@ -1487,6 +1531,15 @@ async fn reinforce_feedback(
         "Hebbian reinforcement applied"
     );
 
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    metrics::HEBBIAN_REINFORCE_DURATION
+        .with_label_values(&[&outcome_label])
+        .observe(duration);
+    metrics::HEBBIAN_REINFORCE_TOTAL
+        .with_label_values(&[&outcome_label, "success"])
+        .inc();
+
     Ok(Json(ReinforceFeedbackResponse {
         memories_processed: stats.memories_processed,
         associations_strengthened: stats.associations_strengthened,
@@ -1509,6 +1562,8 @@ async fn consolidate_memories(
     State(state): State<AppState>,
     Json(req): Json<ConsolidateRequest>,
 ) -> Result<Json<ConsolidateResponse>, AppError> {
+    let op_start = std::time::Instant::now();
+
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
@@ -1553,6 +1608,13 @@ async fn consolidate_memories(
         "Semantic consolidation complete"
     );
 
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    metrics::CONSOLIDATE_DURATION.observe(duration);
+    metrics::CONSOLIDATE_TOTAL
+        .with_label_values(&["success"])
+        .inc();
+
     Ok(Json(ConsolidateResponse {
         memories_analyzed: result.memories_processed,
         facts_extracted: result.facts_extracted,
@@ -1568,6 +1630,9 @@ async fn batch_remember(
     State(state): State<AppState>,
     Json(req): Json<BatchRememberRequest>,
 ) -> Result<Json<BatchRememberResponse>, AppError> {
+    let op_start = std::time::Instant::now();
+    let batch_size = req.memories.len();
+
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     if req.memories.is_empty() {
@@ -1632,6 +1697,23 @@ async fn batch_remember(
     };
 
     let success_count = ids.len();
+
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    metrics::BATCH_STORE_DURATION.observe(duration);
+    metrics::BATCH_STORE_SIZE.observe(batch_size as f64);
+    // Also record individual store metrics
+    for _ in 0..success_count {
+        metrics::MEMORY_STORE_TOTAL
+            .with_label_values(&["success"])
+            .inc();
+    }
+    for _ in 0..error_count {
+        metrics::MEMORY_STORE_TOTAL
+            .with_label_values(&["error"])
+            .inc();
+    }
+
     Ok(Json(BatchRememberResponse {
         ids,
         success_count,
@@ -2135,12 +2217,22 @@ async fn delete_memory(
     Ok(StatusCode::OK)
 }
 
-/// Get all memories for a user
+/// Get all memories for a user with optional filters
 #[derive(Debug, Deserialize)]
 struct GetAllRequest {
     user_id: String,
+    /// Maximum number of results to return (default: 100)
     limit: Option<usize>,
+    /// Filter by minimum importance score (0.0 to 1.0)
     importance_threshold: Option<f32>,
+    /// Filter by tags (returns memories matching ANY of these tags)
+    tags: Option<Vec<String>>,
+    /// Filter by memory type (e.g., "Decision", "Learning", "Error")
+    memory_type: Option<String>,
+    /// Filter by memories created after this timestamp (ISO 8601)
+    created_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter by memories created before this timestamp (ISO 8601)
+    created_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn get_all_memories(
@@ -2153,9 +2245,40 @@ async fn get_all_memories(
 
     let memory_guard = memory.read();
 
+    // Parse memory_type string to ExperienceType if provided
+    let experience_types = req.memory_type.as_ref().map(|type_str| {
+        vec![match type_str.to_lowercase().as_str() {
+            "observation" => ExperienceType::Observation,
+            "decision" => ExperienceType::Decision,
+            "learning" => ExperienceType::Learning,
+            "error" => ExperienceType::Error,
+            "discovery" => ExperienceType::Discovery,
+            "pattern" => ExperienceType::Pattern,
+            "context" => ExperienceType::Context,
+            "task" => ExperienceType::Task,
+            "codeedit" => ExperienceType::CodeEdit,
+            "fileaccess" => ExperienceType::FileAccess,
+            "search" => ExperienceType::Search,
+            "command" => ExperienceType::Command,
+            "conversation" => ExperienceType::Conversation,
+            _ => ExperienceType::Observation, // Default fallback
+        }]
+    });
+
+    // Build time range from created_after/created_before
+    let time_range = match (req.created_after, req.created_before) {
+        (Some(after), Some(before)) => Some((after, before)),
+        (Some(after), None) => Some((after, chrono::Utc::now())),
+        (None, Some(before)) => Some((chrono::DateTime::<chrono::Utc>::MIN_UTC, before)),
+        (None, None) => None,
+    };
+
     let query = MemoryQuery {
         max_results: req.limit.unwrap_or(100),
         importance_threshold: req.importance_threshold,
+        tags: req.tags,
+        experience_types,
+        time_range,
         ..Default::default()
     };
 
@@ -2665,6 +2788,461 @@ async fn forget_by_pattern(
         "success": true,
         "forgotten_count": count,
         "pattern": req.pattern
+    })))
+}
+
+// ====== Bulk Delete Endpoints ======
+
+/// Bulk delete memories by filters (tags, type, date range)
+#[derive(Debug, Deserialize)]
+struct BulkDeleteRequest {
+    user_id: String,
+    /// Delete memories matching ANY of these tags
+    tags: Option<Vec<String>>,
+    /// Delete memories of this type
+    memory_type: Option<String>,
+    /// Delete memories created after this timestamp
+    created_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Delete memories created before this timestamp
+    created_before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+async fn bulk_delete_memories(
+    State(state): State<AppState>,
+    Json(req): Json<BulkDeleteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+    let mut total_count = 0;
+
+    // Delete by tags if specified
+    if let Some(ref tags) = req.tags {
+        if !tags.is_empty() {
+            let count = memory_guard
+                .forget(memory::ForgetCriteria::ByTags(tags.clone()))
+                .map_err(AppError::Internal)?;
+            total_count += count;
+        }
+    }
+
+    // Delete by type if specified
+    if let Some(ref type_str) = req.memory_type {
+        let exp_type = match type_str.to_lowercase().as_str() {
+            "observation" => ExperienceType::Observation,
+            "decision" => ExperienceType::Decision,
+            "learning" => ExperienceType::Learning,
+            "error" => ExperienceType::Error,
+            "discovery" => ExperienceType::Discovery,
+            "pattern" => ExperienceType::Pattern,
+            "context" => ExperienceType::Context,
+            "task" => ExperienceType::Task,
+            "codeedit" => ExperienceType::CodeEdit,
+            "fileaccess" => ExperienceType::FileAccess,
+            "search" => ExperienceType::Search,
+            "command" => ExperienceType::Command,
+            "conversation" => ExperienceType::Conversation,
+            _ => {
+                return Err(AppError::InvalidInput {
+                    field: "memory_type".to_string(),
+                    reason: format!("Invalid memory type: {type_str}"),
+                })
+            }
+        };
+        let count = memory_guard
+            .forget(memory::ForgetCriteria::ByType(exp_type))
+            .map_err(AppError::Internal)?;
+        total_count += count;
+    }
+
+    // Delete by date range if specified
+    if req.created_after.is_some() || req.created_before.is_some() {
+        let start = req
+            .created_after
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        let end = req.created_before.unwrap_or(chrono::Utc::now());
+        let count = memory_guard
+            .forget(memory::ForgetCriteria::ByDateRange { start, end })
+            .map_err(AppError::Internal)?;
+        total_count += count;
+    }
+
+    state.log_event(
+        &req.user_id,
+        "BULK_DELETE",
+        "multiple",
+        &format!("Deleted {total_count} memories"),
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted_count": total_count
+    })))
+}
+
+/// Clear ALL memories for a user (GDPR compliance - right to erasure)
+#[derive(Debug, Deserialize)]
+struct ClearAllRequest {
+    user_id: String,
+    /// Safety confirmation - must be "CONFIRM" to proceed
+    confirm: String,
+}
+
+async fn clear_all_memories(
+    State(state): State<AppState>,
+    Json(req): Json<ClearAllRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Safety check - require explicit confirmation
+    if req.confirm != "CONFIRM" {
+        return Err(AppError::InvalidInput {
+            field: "confirm".to_string(),
+            reason: "Must provide confirm: \"CONFIRM\" to clear all memories".to_string(),
+        });
+    }
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+    let count = memory_guard
+        .forget(memory::ForgetCriteria::All)
+        .map_err(AppError::Internal)?;
+
+    state.log_event(
+        &req.user_id,
+        "CLEAR_ALL",
+        "GDPR",
+        &format!("GDPR erasure: deleted {count} memories"),
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted_count": count,
+        "message": "All memories have been permanently deleted (GDPR erasure)"
+    })))
+}
+
+/// PATCH endpoint for partial memory updates
+#[derive(Debug, Deserialize)]
+struct PatchMemoryRequest {
+    user_id: String,
+    /// New content (optional)
+    content: Option<String>,
+    /// New/additional tags (optional)
+    tags: Option<Vec<String>>,
+    /// New memory type (optional)
+    memory_type: Option<String>,
+}
+
+async fn patch_memory(
+    State(state): State<AppState>,
+    Path(memory_id): Path<String>,
+    Json(req): Json<PatchMemoryRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_memory_id(&memory_id)
+        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory.read();
+
+    let mem_id =
+        uuid::Uuid::parse_str(&memory_id).map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
+
+    // Get current memory
+    let query = MemoryQuery {
+        max_results: 1000,
+        ..Default::default()
+    };
+
+    let all_memories = memory_guard.retrieve(&query).map_err(AppError::Internal)?;
+
+    let shared_memory = all_memories
+        .into_iter()
+        .find(|m| m.id.0 == mem_id)
+        .ok_or_else(|| AppError::MemoryNotFound(memory_id.clone()))?;
+
+    // Clone out of Arc to get mutable Memory
+    let mut current_memory = (*shared_memory).clone();
+
+    let mut changes = Vec::new();
+
+    // Update content if provided
+    if let Some(ref new_content) = req.content {
+        validation::validate_content(new_content, false).map_validation_err("content")?;
+        current_memory.experience.content = new_content.clone();
+        // Re-generate embeddings for new content
+        current_memory.experience.embeddings = None;
+        changes.push("content");
+    }
+
+    // Update tags if provided (add to existing entities)
+    if let Some(ref new_tags) = req.tags {
+        for tag in new_tags {
+            if !current_memory.experience.entities.contains(tag) {
+                current_memory.experience.entities.push(tag.clone());
+            }
+        }
+        changes.push("tags");
+    }
+
+    // Update type if provided
+    if let Some(ref type_str) = req.memory_type {
+        current_memory.experience.experience_type = match type_str.to_lowercase().as_str() {
+            "observation" => ExperienceType::Observation,
+            "decision" => ExperienceType::Decision,
+            "learning" => ExperienceType::Learning,
+            "error" => ExperienceType::Error,
+            "discovery" => ExperienceType::Discovery,
+            "pattern" => ExperienceType::Pattern,
+            "context" => ExperienceType::Context,
+            "task" => ExperienceType::Task,
+            "codeedit" => ExperienceType::CodeEdit,
+            "fileaccess" => ExperienceType::FileAccess,
+            "search" => ExperienceType::Search,
+            "command" => ExperienceType::Command,
+            "conversation" => ExperienceType::Conversation,
+            _ => {
+                return Err(AppError::InvalidInput {
+                    field: "memory_type".to_string(),
+                    reason: format!("Invalid memory type: {type_str}"),
+                })
+            }
+        };
+        changes.push("type");
+    }
+
+    if changes.is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "body".to_string(),
+            reason: "No fields to update provided".to_string(),
+        });
+    }
+
+    // Re-record (will update in storage and re-index)
+    let experience = current_memory.experience.clone();
+    memory_guard
+        .record(experience)
+        .map_err(AppError::Internal)?;
+
+    state.log_event(
+        &req.user_id,
+        "PATCH",
+        &memory_id,
+        &format!("Updated fields: {}", changes.join(", ")),
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "memory_id": memory_id,
+        "updated_fields": changes
+    })))
+}
+
+// ============================================================================
+// RECALL BY TAGS / DATE - Convenience Endpoints
+// ============================================================================
+
+/// Recall memories by tags
+#[derive(Debug, Deserialize)]
+struct RecallByTagsRequest {
+    user_id: String,
+    /// Tags to search for (returns memories matching ANY of these tags)
+    tags: Vec<String>,
+    /// Maximum number of results (default: 50)
+    limit: Option<usize>,
+}
+
+async fn recall_by_tags(
+    State(state): State<AppState>,
+    Json(req): Json<RecallByTagsRequest>,
+) -> Result<Json<RetrieveResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.tags.is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "tags".to_string(),
+            reason: "At least one tag must be provided".to_string(),
+        });
+    }
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+    let limit = req.limit.unwrap_or(50);
+
+    // Search using tag criteria
+    let criteria = memory::storage::SearchCriteria::ByTags(req.tags.clone());
+    let memories = memory_guard
+        .advanced_search(criteria)
+        .map_err(AppError::Internal)?;
+
+    // Apply limit
+    let memories: Vec<_> = memories.into_iter().take(limit).collect();
+    let count = memories.len();
+
+    info!(
+        "📋 Recall by tags: user={}, tags={:?}, found={}",
+        req.user_id, req.tags, count
+    );
+
+    Ok(Json(RetrieveResponse { memories, count }))
+}
+
+/// Recall memories by date range
+#[derive(Debug, Deserialize)]
+struct RecallByDateRequest {
+    user_id: String,
+    /// Start of date range (inclusive) - ISO 8601 format
+    start: chrono::DateTime<chrono::Utc>,
+    /// End of date range (inclusive) - ISO 8601 format
+    end: chrono::DateTime<chrono::Utc>,
+    /// Maximum number of results (default: 50)
+    limit: Option<usize>,
+}
+
+async fn recall_by_date(
+    State(state): State<AppState>,
+    Json(req): Json<RecallByDateRequest>,
+) -> Result<Json<RetrieveResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.end < req.start {
+        return Err(AppError::InvalidInput {
+            field: "end".to_string(),
+            reason: "End date must be after start date".to_string(),
+        });
+    }
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+    let limit = req.limit.unwrap_or(50);
+
+    // Search using date range criteria
+    let criteria = memory::storage::SearchCriteria::ByDate {
+        start: req.start,
+        end: req.end,
+    };
+    let memories = memory_guard
+        .advanced_search(criteria)
+        .map_err(AppError::Internal)?;
+
+    // Apply limit
+    let memories: Vec<_> = memories.into_iter().take(limit).collect();
+    let count = memories.len();
+
+    info!(
+        "📅 Recall by date: user={}, start={}, end={}, found={}",
+        req.user_id, req.start, req.end, count
+    );
+
+    Ok(Json(RetrieveResponse { memories, count }))
+}
+
+/// Forget memories by tags
+#[derive(Debug, Deserialize)]
+struct ForgetByTagsRequest {
+    user_id: String,
+    /// Tags to match for deletion (deletes memories matching ANY of these tags)
+    tags: Vec<String>,
+}
+
+async fn forget_by_tags(
+    State(state): State<AppState>,
+    Json(req): Json<ForgetByTagsRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.tags.is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "tags".to_string(),
+            reason: "At least one tag must be provided".to_string(),
+        });
+    }
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+
+    let deleted_count = memory_guard
+        .forget(memory::ForgetCriteria::ByTags(req.tags.clone()))
+        .map_err(AppError::Internal)?;
+
+    info!(
+        "🏷️ Forget by tags: user={}, tags={:?}, deleted={}",
+        req.user_id, req.tags, deleted_count
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted_count": deleted_count,
+        "tags": req.tags
+    })))
+}
+
+/// Forget memories by date range
+#[derive(Debug, Deserialize)]
+struct ForgetByDateRequest {
+    user_id: String,
+    /// Start of date range (inclusive) - ISO 8601 format
+    start: chrono::DateTime<chrono::Utc>,
+    /// End of date range (inclusive) - ISO 8601 format
+    end: chrono::DateTime<chrono::Utc>,
+}
+
+async fn forget_by_date(
+    State(state): State<AppState>,
+    Json(req): Json<ForgetByDateRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.end < req.start {
+        return Err(AppError::InvalidInput {
+            field: "end".to_string(),
+            reason: "End date must be after start date".to_string(),
+        });
+    }
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+
+    let deleted_count = memory_guard
+        .forget(memory::ForgetCriteria::ByDateRange {
+            start: req.start,
+            end: req.end,
+        })
+        .map_err(AppError::Internal)?;
+
+    info!(
+        "📅 Forget by date: user={}, start={}, end={}, deleted={}",
+        req.user_id, req.start, req.end, deleted_count
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted_count": deleted_count,
+        "start": req.start,
+        "end": req.end
     })))
 }
 
@@ -3395,10 +3973,16 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
 
-            // Run maintenance in blocking thread pool to avoid blocking async runtime
+            // Run maintenance + periodic flush in blocking thread pool
+            // This ensures durability in async write mode (data flushed every maintenance cycle)
             let manager_clone = Arc::clone(&manager_for_maintenance);
             tokio::task::spawn_blocking(move || {
                 manager_clone.run_maintenance_all_users();
+                // Periodic flush ensures data durability for async write mode
+                // In sync mode this is fast (little dirty data), in async mode this is critical
+                if let Err(e) = manager_clone.flush_all_databases() {
+                    tracing::warn!("Periodic flush failed: {}", e);
+                }
             });
         }
     });
@@ -3449,8 +4033,11 @@ async fn main() -> Result<()> {
         .route("/api/memory/{memory_id}", get(get_memory))
         .route("/api/memory/{memory_id}", axum::routing::put(update_memory))
         .route("/api/memory/{memory_id}", delete(delete_memory))
+        .route("/api/memory/{memory_id}", axum::routing::patch(patch_memory))
         .route("/api/memories", post(get_all_memories))
         .route("/api/memories/history", post(get_history))
+        .route("/api/memories/bulk", post(bulk_delete_memories))
+        .route("/api/memories/clear", post(clear_all_memories))
         // Compression & Storage Management
         .route("/api/memory/compress", post(compress_memory))
         .route("/api/memory/decompress", post(decompress_memory))
@@ -3460,6 +4047,11 @@ async fn main() -> Result<()> {
         .route("/api/forget/age", post(forget_by_age))
         .route("/api/forget/importance", post(forget_by_importance))
         .route("/api/forget/pattern", post(forget_by_pattern))
+        .route("/api/forget/tags", post(forget_by_tags))
+        .route("/api/forget/date", post(forget_by_date))
+        // Recall by filters (tag/date convenience endpoints)
+        .route("/api/recall/tags", post(recall_by_tags))
+        .route("/api/recall/date", post(recall_by_date))
         // Advanced Search
         .route("/api/search/advanced", post(advanced_search))
         .route("/api/search/multimodal", post(multimodal_search))

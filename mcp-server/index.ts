@@ -263,6 +263,82 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
+      {
+        name: "recall_by_tags",
+        description: "Search memories by tags. Returns memories matching ANY of the provided tags.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tags to search for (returns memories matching ANY tag)",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum number of results (default: 20)",
+              default: 20,
+            },
+          },
+          required: ["tags"],
+        },
+      },
+      {
+        name: "recall_by_date",
+        description: "Search memories within a date range.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            start: {
+              type: "string",
+              description: "Start date (ISO 8601 format, e.g., '2024-01-01T00:00:00Z')",
+            },
+            end: {
+              type: "string",
+              description: "End date (ISO 8601 format, e.g., '2024-12-31T23:59:59Z')",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum number of results (default: 20)",
+              default: 20,
+            },
+          },
+          required: ["start", "end"],
+        },
+      },
+      {
+        name: "forget_by_tags",
+        description: "Delete memories matching ANY of the provided tags.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tags to match for deletion",
+            },
+          },
+          required: ["tags"],
+        },
+      },
+      {
+        name: "forget_by_date",
+        description: "Delete memories within a date range.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            start: {
+              type: "string",
+              description: "Start date (ISO 8601 format)",
+            },
+            end: {
+              type: "string",
+              description: "End date (ISO 8601 format)",
+            },
+          },
+          required: ["start", "end"],
+        },
+      },
     ],
   };
 });
@@ -514,6 +590,122 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: `Memory Statistics:\n${JSON.stringify(result, null, 2)}`,
+            },
+          ],
+        };
+      }
+
+      case "recall_by_tags": {
+        const { tags, limit = 20 } = args as { tags: string[]; limit?: number };
+
+        const result = await apiCall<{ memories: Memory[]; count: number }>("/api/recall/tags", "POST", {
+          user_id: USER_ID,
+          tags,
+          limit,
+        });
+
+        const memories = result.memories || [];
+
+        if (memories.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No memories found with tags: ${tags.join(", ")}`,
+              },
+            ],
+          };
+        }
+
+        const formatted = memories
+          .map((m, i) => {
+            const content = getContent(m);
+            return `${i + 1}. ${content.slice(0, 80)}${content.length > 80 ? '...' : ''}\n   Type: ${getType(m)} | ID: ${m.id.slice(0, 8)}...`;
+          })
+          .join("\n\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${memories.length} memories with tags [${tags.join(", ")}]:\n\n${formatted}`,
+            },
+          ],
+        };
+      }
+
+      case "recall_by_date": {
+        const { start, end, limit = 20 } = args as { start: string; end: string; limit?: number };
+
+        const result = await apiCall<{ memories: Memory[]; count: number }>("/api/recall/date", "POST", {
+          user_id: USER_ID,
+          start,
+          end,
+          limit,
+        });
+
+        const memories = result.memories || [];
+
+        if (memories.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No memories found between ${start} and ${end}`,
+              },
+            ],
+          };
+        }
+
+        const formatted = memories
+          .map((m, i) => {
+            const content = getContent(m);
+            return `${i + 1}. ${content.slice(0, 80)}${content.length > 80 ? '...' : ''}\n   Type: ${getType(m)} | Created: ${m.created_at || 'unknown'}`;
+          })
+          .join("\n\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${memories.length} memories between ${start} and ${end}:\n\n${formatted}`,
+            },
+          ],
+        };
+      }
+
+      case "forget_by_tags": {
+        const { tags } = args as { tags: string[] };
+
+        const result = await apiCall<{ deleted_count: number }>("/api/forget/tags", "POST", {
+          user_id: USER_ID,
+          tags,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Deleted ${result.deleted_count} memories with tags: ${tags.join(", ")}`,
+            },
+          ],
+        };
+      }
+
+      case "forget_by_date": {
+        const { start, end } = args as { start: string; end: string };
+
+        const result = await apiCall<{ deleted_count: number }>("/api/forget/date", "POST", {
+          user_id: USER_ID,
+          start,
+          end,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Deleted ${result.deleted_count} memories between ${start} and ${end}`,
             },
           ],
         };

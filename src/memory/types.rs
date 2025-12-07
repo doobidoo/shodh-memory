@@ -1512,6 +1512,17 @@ pub enum ForgetCriteria {
     OlderThan(u32),     // Days
     LowImportance(f32), // Threshold
     Pattern(String),    // Regex pattern
+    /// Delete memories matching ANY of these tags
+    ByTags(Vec<String>),
+    /// Delete memories within a date range (inclusive)
+    ByDateRange {
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    },
+    /// Delete memories of a specific type
+    ByType(ExperienceType),
+    /// Delete ALL memories for a user (GDPR compliance - right to erasure)
+    All,
 }
 
 /// Working memory - fast access, limited size
@@ -1580,6 +1591,22 @@ impl WorkingMemory {
 
     pub fn size(&self) -> usize {
         self.memories.len()
+    }
+
+    /// Get the number of memories (alias for size())
+    pub fn len(&self) -> usize {
+        self.memories.len()
+    }
+
+    /// Check if the working memory is empty
+    pub fn is_empty(&self) -> bool {
+        self.memories.is_empty()
+    }
+
+    /// Clear all memories from working memory
+    pub fn clear(&mut self) {
+        self.memories.clear();
+        self.access_order.clear();
     }
 
     pub fn contains(&self, id: &MemoryId) -> bool {
@@ -1752,6 +1779,22 @@ impl SessionMemory {
 
     pub fn size_mb(&self) -> usize {
         self.current_size_bytes / (1024 * 1024)
+    }
+
+    /// Get the number of memories
+    pub fn len(&self) -> usize {
+        self.memories.len()
+    }
+
+    /// Check if the session memory is empty
+    pub fn is_empty(&self) -> bool {
+        self.memories.is_empty()
+    }
+
+    /// Clear all memories from session memory
+    pub fn clear(&mut self) {
+        self.memories.clear();
+        self.current_size_bytes = 0;
     }
 
     pub fn contains(&self, id: &MemoryId) -> bool {
