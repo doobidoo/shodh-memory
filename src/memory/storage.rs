@@ -207,7 +207,14 @@ impl MemoryStorage {
     }
 
     /// Update an existing memory
+    ///
+    /// ALGO-004 FIX: Re-indexes memory after update to handle importance drift.
+    /// When Hebbian feedback changes importance, the old bucket index becomes stale.
+    /// We remove old indices before storing to ensure index consistency.
     pub fn update(&self, memory: &Memory) -> Result<()> {
+        // Remove old indices first (they may have stale importance buckets)
+        self.remove_from_indices(&memory.id)?;
+        // Store with fresh indices
         self.store(memory)
     }
 
