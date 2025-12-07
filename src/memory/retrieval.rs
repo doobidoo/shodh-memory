@@ -234,7 +234,7 @@ impl RetrievalEngine {
     /// Search for memory IDs only (for cache-aware retrieval)
     /// Returns (MemoryId, similarity_score) pairs
     pub fn search_ids(&self, query: &Query, limit: usize) -> Result<Vec<(MemoryId, f32)>> {
-        // Get or generate query embedding
+        // BUG-006 FIX: Log warning for empty queries
         let query_embedding = if let Some(embedding) = &query.query_embedding {
             embedding.clone()
         } else if let Some(query_text) = &query.query_text {
@@ -242,6 +242,9 @@ impl RetrievalEngine {
                 .encode(query_text)
                 .context("Failed to generate query embedding")?
         } else {
+            tracing::warn!(
+                "Empty query in search_ids: no query_text or query_embedding provided"
+            );
             return Ok(Vec::new());
         };
 
@@ -290,7 +293,7 @@ impl RetrievalEngine {
 
     /// PRODUCTION: Similarity search using Vamana HNSW (sub-millisecond, zero-copy)
     fn similarity_search(&self, query: &Query, limit: usize) -> Result<Vec<SharedMemory>> {
-        // Get or generate query embedding
+        // BUG-006 FIX: Log warning for empty queries
         let query_embedding = if let Some(embedding) = &query.query_embedding {
             embedding.clone()
         } else if let Some(query_text) = &query.query_text {
@@ -298,6 +301,9 @@ impl RetrievalEngine {
                 .encode(query_text)
                 .context("Failed to generate query embedding")?
         } else {
+            tracing::warn!(
+                "Empty query in similarity_search: no query_text or query_embedding provided"
+            );
             return Ok(Vec::new());
         };
 

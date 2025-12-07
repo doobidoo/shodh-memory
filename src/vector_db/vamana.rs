@@ -441,6 +441,38 @@ impl VamanaIndex {
         }
     }
 
+    /// Get vector by ID from a storage reference (static helper for use when locks are already held)
+    fn get_vector_from_storage(storage: &VectorStorage, id: u32) -> Result<Vec<f32>> {
+        match storage {
+            VectorStorage::Memory(vecs) => Ok(vecs
+                .get(id as usize)
+                .ok_or_else(|| anyhow!("Vector {id} not found"))?
+                .clone()),
+            VectorStorage::Mmap {
+                mmap,
+                dimension,
+                num_vectors,
+            } => {
+                if id as usize >= *num_vectors {
+                    return Err(anyhow!(
+                        "Vector {id} out of bounds (num_vectors={})",
+                        num_vectors
+                    ));
+                }
+                let start = id as usize * dimension;
+                let end = start + dimension;
+                let ptr = mmap.as_ptr();
+                let total_floats = mmap.len() / std::mem::size_of::<f32>();
+                if end > total_floats {
+                    return Err(anyhow!("Vector slice bounds exceed mmap capacity"));
+                }
+                let float_slice =
+                    unsafe { std::slice::from_raw_parts(ptr as *const f32, total_floats) };
+                Ok(float_slice[start..end].to_vec())
+            }
+        }
+    }
+
     /// Greedy search for nearest neighbors
     fn greedy_search(&self, query: &[f32], k: usize, entry: u32) -> Result<Vec<SearchCandidate>> {
         let graph = self.graph.read();
@@ -651,7 +683,10 @@ impl VamanaIndex {
             neighbor_distances: Vec::new(),
         });
 
-        // OPTIMIZATION: Simplified reverse edge updates
+        // BUG-004 FIX: Distance-aware neighbor pruning for incremental inserts
+        // Instead of truncate() which removes newest (possibly best) neighbors,
+        // we sort by distance and keep the closest ones.
+        let vectors = self.vectors.read();
         for &neighbor_id in &neighbors {
             if neighbor_id as usize >= graph.len() {
                 continue;
@@ -659,14 +694,41 @@ impl VamanaIndex {
 
             graph[neighbor_id as usize].neighbors.push(id);
 
-            // Simple pruning - just keep first max_degree neighbors
-            // Avoid expensive distance calculations during incremental adds
+            // Prune by distance when over max_degree
             if graph[neighbor_id as usize].neighbors.len() > self.config.max_degree {
-                graph[neighbor_id as usize]
-                    .neighbors
-                    .truncate(self.config.max_degree);
+                // Get neighbor's vector for distance calculations
+                if let Ok(neighbor_vec) = Self::get_vector_from_storage(&vectors, neighbor_id) {
+                    // Calculate distances to all neighbors
+                    let mut neighbor_distances: Vec<(u32, f32)> = graph[neighbor_id as usize]
+                        .neighbors
+                        .iter()
+                        .filter_map(|&n_id| {
+                            Self::get_vector_from_storage(&vectors, n_id)
+                                .ok()
+                                .map(|v| (n_id, dot_product_inline(&neighbor_vec, &v)))
+                        })
+                        .collect();
+
+                    // Sort by distance (higher dot product = closer for normalized vectors)
+                    neighbor_distances.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                    });
+
+                    // Keep only max_degree closest neighbors
+                    graph[neighbor_id as usize].neighbors = neighbor_distances
+                        .into_iter()
+                        .take(self.config.max_degree)
+                        .map(|(id, _)| id)
+                        .collect();
+                } else {
+                    // Fallback: truncate if vector access fails
+                    graph[neighbor_id as usize]
+                        .neighbors
+                        .truncate(self.config.max_degree);
+                }
             }
         }
+        drop(vectors);
 
         self.num_vectors += 1;
         self.incremental_inserts

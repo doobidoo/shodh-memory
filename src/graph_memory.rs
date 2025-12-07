@@ -484,6 +484,8 @@ impl GraphMemory {
     /// Add or update an entity node
     /// Salience is updated using the formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
     /// This means frequently mentioned entities grow in salience (gravitational wells get heavier)
+    ///
+    /// BUG-002 FIX: Handles crash recovery for orphaned entities/stale indices
     pub fn add_entity(&self, mut entity: EntityNode) -> Result<Uuid> {
         // Check if entity already exists by name
         let existing_uuid = {
@@ -491,10 +493,12 @@ impl GraphMemory {
             index.get(&entity.name).cloned()
         };
 
+        let is_new_entity;
         if let Some(uuid) = existing_uuid {
-            // Update existing entity
-            entity.uuid = uuid;
+            // BUG-002 FIX: Verify entity actually exists in DB (handles stale index)
             if let Some(existing) = self.get_entity(&uuid)? {
+                // Update existing entity
+                entity.uuid = uuid;
                 entity.mention_count = existing.mention_count + 1;
                 entity.last_seen_at = Utc::now();
                 entity.created_at = existing.created_at; // Preserve original creation time
@@ -505,6 +509,19 @@ impl GraphMemory {
                 // This caps at about 1.3x boost at 20 mentions
                 let frequency_boost = 1.0 + 0.1 * (entity.mention_count as f32).ln();
                 entity.salience = (existing.salience * frequency_boost).min(1.0);
+                is_new_entity = false;
+            } else {
+                // BUG-002 FIX: Stale index entry - entity in index but not in DB
+                // Treat as new entity (index will be updated below)
+                tracing::warn!(
+                    "Stale index entry for entity '{}' (uuid={}), recreating",
+                    entity.name, uuid
+                );
+                entity.uuid = Uuid::new_v4();
+                entity.created_at = Utc::now();
+                entity.last_seen_at = entity.created_at;
+                entity.mention_count = 1;
+                is_new_entity = true;
             }
         } else {
             // New entity
@@ -513,24 +530,33 @@ impl GraphMemory {
             entity.last_seen_at = entity.created_at;
             entity.mention_count = 1;
             // Salience stays at base_salience for new entities
-
-            // Increment entity counter for new entities only
-            self.entity_count.fetch_add(1, Ordering::Relaxed);
+            is_new_entity = true;
         }
 
-        // Store in database
-        let key = entity.uuid.as_bytes();
-        let value = bincode::serialize(&entity)?;
-        self.entities_db.put(key, value)?;
+        // BUG-002 FIX: Write index FIRST, then entity
+        // Rationale: If crash after index write but before entity write,
+        // next add_entity call will detect stale index (above) and recover.
+        // This is safer than orphaned entities with no index reference.
 
-        // Update both in-memory index and persisted index DB
+        // Update in-memory index first
         {
             let mut index = self.entity_name_index.write();
             index.insert(entity.name.clone(), entity.uuid);
         }
-        // Persist name->UUID mapping for O(1) startup
+
+        // Persist name->UUID mapping
         self.entity_name_index_db
             .put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
+
+        // Now store entity in database
+        let key = entity.uuid.as_bytes();
+        let value = bincode::serialize(&entity)?;
+        self.entities_db.put(key, value)?;
+
+        // Increment counter only for truly new entities
+        if is_new_entity {
+            self.entity_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(entity.uuid)
     }

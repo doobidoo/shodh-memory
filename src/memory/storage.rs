@@ -112,13 +112,15 @@ impl MemoryStorage {
     /// Update secondary indices for efficient retrieval
     fn update_indices(&self, memory: &Memory) -> Result<()> {
         let mut batch = WriteBatch::default();
-        let memory_id_str = memory.id.0.to_string();
 
         // === Standard Indices ===
 
         // Index by date (for temporal queries)
-        let date_key = format!("date:{}", memory.created_at.format("%Y%m%d"));
-        batch.put(date_key.as_bytes(), memory_id_str.as_bytes());
+        // BUG-001 FIX: Include memory_id in key to allow multiple memories per day
+        // Old format: date:YYYYMMDD (overwrites on same day)
+        // New format: date:YYYYMMDD:uuid (unique per memory)
+        let date_key = format!("date:{}:{}", memory.created_at.format("%Y%m%d"), memory.id.0);
+        batch.put(date_key.as_bytes(), b"1");
 
         // Index by type
         let type_key = format!(
@@ -152,16 +154,16 @@ impl MemoryStorage {
             batch.put(mission_key.as_bytes(), b"1");
         }
 
-        // Index by geo_location (for spatial queries)
-        // Key format: geo:lat:lon:memory_id, Value: memory_id
+        // Index by geo_location (for spatial queries) using geohash
+        // Key format: geo:GEOHASH:memory_id (geohash at precision 10 = ~1.2m x 60cm)
+        // Geohash enables efficient prefix-based spatial queries
         if let Some(geo) = memory.experience.geo_location {
             let lat = geo[0];
             let lon = geo[1];
-            // Round to 4 decimal places (~11m precision) for indexing
-            let lat_str = format!("{lat:.4}");
-            let lon_str = format!("{lon:.4}");
-            let geo_key = format!("geo:{}:{}:{}", lat_str, lon_str, memory.id.0);
-            batch.put(geo_key.as_bytes(), memory_id_str.as_bytes());
+            // Use precision 10 for warehouse-level accuracy (~1.2m cells)
+            let geohash = super::types::geohash_encode(lat, lon, 10);
+            let geo_key = format!("geo:{}:{}", geohash, memory.id.0);
+            batch.put(geo_key.as_bytes(), b"1");
         }
 
         // Index by action_type (for action-based retrieval)
@@ -222,31 +224,71 @@ impl MemoryStorage {
     }
 
     /// Remove memory from all indices
+    /// BUG-005 FIX: Direct key deletion instead of O(n) scan with contains()
+    /// We reconstruct index keys from memory metadata for O(k) deletion
     fn remove_from_indices(&self, id: &MemoryId) -> Result<()> {
+        // Fetch memory to reconstruct index keys
+        let memory = match self.get(id) {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::debug!("Memory {} not found, skipping index cleanup", id.0);
+                return Ok(());
+            }
+        };
+
         let mut batch = WriteBatch::default();
 
-        // Iterate through all index entries and remove those matching this ID
-        let prefix_patterns = vec![
-            format!("date:"),
-            format!("type:"),
-            format!("importance:"),
-            format!("entity:"),
-        ];
+        // Reconstruct and delete all index keys directly (O(k) instead of O(n))
 
-        for prefix in prefix_patterns {
-            let iter = self.index_db.iterator(IteratorMode::From(
-                prefix.as_bytes(),
-                rocksdb::Direction::Forward,
-            ));
-            for (key, _) in iter.flatten() {
-                let key_str = String::from_utf8_lossy(&key);
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-                if key_str.contains(&id.0.to_string()) {
-                    batch.delete(&key);
-                }
-            }
+        // Date index
+        let date_key = format!("date:{}:{}", memory.created_at.format("%Y%m%d"), id.0);
+        batch.delete(date_key.as_bytes());
+
+        // Type index
+        let type_key = format!("type:{:?}:{}", memory.experience.experience_type, id.0);
+        batch.delete(type_key.as_bytes());
+
+        // Importance index
+        let importance_bucket = (memory.importance() * 10.0) as u32;
+        let importance_key = format!("importance:{}:{}", importance_bucket, id.0);
+        batch.delete(importance_key.as_bytes());
+
+        // Entity indices
+        for entity in &memory.experience.entities {
+            let entity_key = format!("entity:{}:{}", entity, id.0);
+            batch.delete(entity_key.as_bytes());
+        }
+
+        // Robot index
+        if let Some(ref robot_id) = memory.experience.robot_id {
+            let robot_key = format!("robot:{}:{}", robot_id, id.0);
+            batch.delete(robot_key.as_bytes());
+        }
+
+        // Mission index
+        if let Some(ref mission_id) = memory.experience.mission_id {
+            let mission_key = format!("mission:{}:{}", mission_id, id.0);
+            batch.delete(mission_key.as_bytes());
+        }
+
+        // Geo index
+        if let Some(geo) = memory.experience.geo_location {
+            let geohash = super::types::geohash_encode(geo[0], geo[1], 10);
+            let geo_key = format!("geo:{}:{}", geohash, id.0);
+            batch.delete(geo_key.as_bytes());
+        }
+
+        // Action index
+        if let Some(ref action_type) = memory.experience.action_type {
+            let action_key = format!("action:{}:{}", action_type, id.0);
+            batch.delete(action_key.as_bytes());
+        }
+
+        // Reward index
+        if let Some(reward) = memory.experience.reward {
+            let reward_bucket = ((reward + 1.0) * 10.0) as i32;
+            let reward_key = format!("reward:{}:{}", reward_bucket, id.0);
+            batch.delete(reward_key.as_bytes());
         }
 
         // DURABILITY: Sync write for index consistency
@@ -331,21 +373,27 @@ impl MemoryStorage {
     ) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
         let start_key = format!("date:{}", start.format("%Y%m%d"));
-        let end_key = format!("date:{}", end.format("%Y%m%d"));
+        // BUG-001 FIX: End key needs ~ suffix to include all UUIDs for that date
+        // Keys are: date:YYYYMMDD:uuid, so date:20251207~ comes after all Dec 7 entries
+        let end_key = format!("date:{}~", end.format("%Y%m%d"));
 
         let iter = self.index_db.iterator(IteratorMode::From(
             start_key.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, value) in iter.flatten() {
+        for (key, _value) in iter.flatten() {
             let key_str = String::from_utf8_lossy(&key);
             if key_str.as_ref() > end_key.as_str() {
                 break;
             }
+            // BUG-001 FIX: Extract memory_id from key (format: date:YYYYMMDD:uuid)
             if key_str.starts_with("date:") {
-                let id_str = String::from_utf8_lossy(&value);
-                if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
-                    ids.push(MemoryId(uuid));
+                let parts: Vec<&str> = key_str.split(':').collect();
+                if parts.len() >= 3 {
+                    // parts[0] = "date", parts[1] = "YYYYMMDD", parts[2] = uuid
+                    if let Ok(uuid) = uuid::Uuid::parse_str(parts[2]) {
+                        ids.push(MemoryId(uuid));
+                    }
                 }
             }
         }
@@ -482,39 +530,50 @@ impl MemoryStorage {
         Ok(ids)
     }
 
-    /// Search memories by geographic location (haversine distance)
+    /// Search memories by geographic location using geohash prefix scanning
+    ///
+    /// Performance: O(k) where k = memories in ~9 geohash cells covering the radius
+    /// Previous approach was O(n) where n = all geo-indexed memories
     fn search_by_location(
         &self,
         center_lat: f64,
         center_lon: f64,
         radius_meters: f64,
     ) -> Result<Vec<MemoryId>> {
-        use super::types::GeoFilter;
+        use super::types::{geohash_decode, geohash_search_prefixes, GeoFilter};
 
         let geo_filter = GeoFilter::new(center_lat, center_lon, radius_meters);
         let mut ids = Vec::new();
 
-        // Scan all memories with geo_location (prefix scan on geo index)
-        let prefix = "geo:";
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        // Get geohash prefixes for center + neighbors at appropriate precision
+        let prefixes = geohash_search_prefixes(center_lat, center_lon, radius_meters);
 
-        for (key, value) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with(prefix) {
-                break;
-            }
+        // Scan only the relevant geohash cells (9 cells = center + 8 neighbors)
+        for geohash_prefix in prefixes {
+            let prefix = format!("geo:{}:", geohash_prefix);
+            let iter = self.index_db.iterator(IteratorMode::From(
+                prefix.as_bytes(),
+                rocksdb::Direction::Forward,
+            ));
 
-            // Key format: geo:lat:lon:memory_id
-            // Value contains the memory ID
-            let parts: Vec<&str> = key_str.split(':').collect();
-            if parts.len() >= 4 {
-                if let (Ok(lat), Ok(lon)) = (parts[1].parse::<f64>(), parts[2].parse::<f64>()) {
-                    if geo_filter.contains(lat, lon) {
-                        let id_str = String::from_utf8_lossy(&value);
-                        if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
+            for (key, _value) in iter.flatten() {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+
+                // Key format: geo:GEOHASH:memory_id
+                let parts: Vec<&str> = key_str.split(':').collect();
+                if parts.len() >= 3 {
+                    let geohash = parts[1];
+                    // Decode geohash to get approximate lat/lon for distance check
+                    let (min_lat, min_lon, max_lat, max_lon) = geohash_decode(geohash);
+                    let approx_lat = (min_lat + max_lat) / 2.0;
+                    let approx_lon = (min_lon + max_lon) / 2.0;
+
+                    // Final haversine check for edge cases at cell boundaries
+                    if geo_filter.contains(approx_lat, approx_lon) {
+                        if let Ok(uuid) = uuid::Uuid::parse_str(parts[2]) {
                             ids.push(MemoryId(uuid));
                         }
                     }

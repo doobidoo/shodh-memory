@@ -978,6 +978,187 @@ impl GeoFilter {
     }
 }
 
+// ============================================================================
+// Geohash utilities for efficient spatial indexing
+// ============================================================================
+
+/// Base32 character set for geohash encoding
+const GEOHASH_CHARS: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+
+/// Precision reference table (approximate cell dimensions at equator):
+/// - 1 char: 5000km x 5000km
+/// - 2 chars: 1250km x 625km
+/// - 3 chars: 156km x 156km
+/// - 4 chars: 39km x 20km
+/// - 5 chars: 5km x 5km
+/// - 6 chars: 1.2km x 600m
+/// - 7 chars: 150m x 150m
+/// - 8 chars: 38m x 19m
+/// - 9 chars: 5m x 5m (warehouse aisle)
+/// - 10 chars: 1.2m x 60cm (shelf location)
+/// - 11 chars: 15cm x 15cm (sub-meter)
+/// - 12 chars: 4cm x 2cm (high precision)
+
+/// Encode latitude/longitude to geohash string
+pub fn geohash_encode(lat: f64, lon: f64, precision: usize) -> String {
+    let mut lat_range = (-90.0, 90.0);
+    let mut lon_range = (-180.0, 180.0);
+    let mut hash = String::with_capacity(precision);
+    let mut bits = 0u8;
+    let mut bit_count = 0;
+    let mut is_lon = true;
+
+    while hash.len() < precision {
+        if is_lon {
+            let mid = (lon_range.0 + lon_range.1) / 2.0;
+            if lon >= mid {
+                bits = (bits << 1) | 1;
+                lon_range.0 = mid;
+            } else {
+                bits <<= 1;
+                lon_range.1 = mid;
+            }
+        } else {
+            let mid = (lat_range.0 + lat_range.1) / 2.0;
+            if lat >= mid {
+                bits = (bits << 1) | 1;
+                lat_range.0 = mid;
+            } else {
+                bits <<= 1;
+                lat_range.1 = mid;
+            }
+        }
+        is_lon = !is_lon;
+        bit_count += 1;
+
+        if bit_count == 5 {
+            hash.push(GEOHASH_CHARS[bits as usize] as char);
+            bits = 0;
+            bit_count = 0;
+        }
+    }
+
+    hash
+}
+
+/// Decode geohash to bounding box (min_lat, min_lon, max_lat, max_lon)
+pub fn geohash_decode(hash: &str) -> (f64, f64, f64, f64) {
+    let mut lat_range = (-90.0, 90.0);
+    let mut lon_range = (-180.0, 180.0);
+    let mut is_lon = true;
+
+    for c in hash.chars() {
+        let idx = GEOHASH_CHARS.iter().position(|&x| x == c as u8).unwrap_or(0);
+        for i in (0..5).rev() {
+            let bit = (idx >> i) & 1;
+            if is_lon {
+                let mid = (lon_range.0 + lon_range.1) / 2.0;
+                if bit == 1 {
+                    lon_range.0 = mid;
+                } else {
+                    lon_range.1 = mid;
+                }
+            } else {
+                let mid = (lat_range.0 + lat_range.1) / 2.0;
+                if bit == 1 {
+                    lat_range.0 = mid;
+                } else {
+                    lat_range.1 = mid;
+                }
+            }
+            is_lon = !is_lon;
+        }
+    }
+
+    (lat_range.0, lon_range.0, lat_range.1, lon_range.1)
+}
+
+/// Get 8 neighboring geohashes (N, NE, E, SE, S, SW, W, NW)
+pub fn geohash_neighbors(hash: &str) -> Vec<String> {
+    if hash.is_empty() {
+        return vec![];
+    }
+
+    let (min_lat, min_lon, max_lat, max_lon) = geohash_decode(hash);
+    let lat_delta = max_lat - min_lat;
+    let lon_delta = max_lon - min_lon;
+    let center_lat = (min_lat + max_lat) / 2.0;
+    let center_lon = (min_lon + max_lon) / 2.0;
+    let precision = hash.len();
+
+    let directions: [(f64, f64); 8] = [
+        (1.0, 0.0),   // N
+        (1.0, 1.0),   // NE
+        (0.0, 1.0),   // E
+        (-1.0, 1.0),  // SE
+        (-1.0, 0.0),  // S
+        (-1.0, -1.0), // SW
+        (0.0, -1.0),  // W
+        (1.0, -1.0),  // NW
+    ];
+
+    directions
+        .iter()
+        .map(|(lat_dir, lon_dir)| {
+            let neighbor_lat = center_lat + lat_dir * lat_delta;
+            let neighbor_lon = center_lon + lon_dir * lon_delta;
+            geohash_encode(
+                neighbor_lat.clamp(-90.0, 90.0),
+                wrap_longitude(neighbor_lon),
+                precision,
+            )
+        })
+        .collect()
+}
+
+/// Wrap longitude to [-180, 180]
+fn wrap_longitude(lon: f64) -> f64 {
+    if lon > 180.0 {
+        lon - 360.0
+    } else if lon < -180.0 {
+        lon + 360.0
+    } else {
+        lon
+    }
+}
+
+/// Get optimal geohash precision for a given search radius
+/// Returns precision that gives cells roughly matching the radius
+pub fn geohash_precision_for_radius(radius_meters: f64) -> usize {
+    // Approximate cell sizes at equator (width in meters)
+    const CELL_SIZES: [(usize, f64); 12] = [
+        (1, 5_000_000.0),
+        (2, 1_250_000.0),
+        (3, 156_000.0),
+        (4, 39_000.0),
+        (5, 5_000.0),
+        (6, 1_200.0),
+        (7, 150.0),
+        (8, 38.0),
+        (9, 5.0),
+        (10, 1.2),
+        (11, 0.15),
+        (12, 0.04),
+    ];
+
+    for (precision, cell_size) in CELL_SIZES.iter() {
+        if *cell_size <= radius_meters * 2.0 {
+            return *precision;
+        }
+    }
+    12 // Maximum precision
+}
+
+/// Get all geohash prefixes to scan for a radius search
+/// Returns the center hash and its neighbors at appropriate precision
+pub fn geohash_search_prefixes(lat: f64, lon: f64, radius_meters: f64) -> Vec<String> {
+    let precision = geohash_precision_for_radius(radius_meters);
+    let center = geohash_encode(lat, lon, precision);
+    let mut prefixes = geohash_neighbors(&center);
+    prefixes.push(center);
+    prefixes
+}
+
 /// Query for retrieving memories
 #[derive(Debug, Clone)]
 pub struct Query {
