@@ -515,7 +515,8 @@ impl GraphMemory {
                 // Treat as new entity (index will be updated below)
                 tracing::warn!(
                     "Stale index entry for entity '{}' (uuid={}), recreating",
-                    entity.name, uuid
+                    entity.name,
+                    uuid
                 );
                 entity.uuid = Uuid::new_v4();
                 entity.created_at = Utc::now();

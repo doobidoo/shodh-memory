@@ -710,9 +710,8 @@ impl VamanaIndex {
                         .collect();
 
                     // Sort by distance (higher dot product = closer for normalized vectors)
-                    neighbor_distances.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-                    });
+                    neighbor_distances
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
                     // Keep only max_degree closest neighbors
                     graph[neighbor_id as usize].neighbors = neighbor_distances

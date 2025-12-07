@@ -242,9 +242,7 @@ impl RetrievalEngine {
                 .encode(query_text)
                 .context("Failed to generate query embedding")?
         } else {
-            tracing::warn!(
-                "Empty query in search_ids: no query_text or query_embedding provided"
-            );
+            tracing::warn!("Empty query in search_ids: no query_text or query_embedding provided");
             return Ok(Vec::new());
         };
 

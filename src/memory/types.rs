@@ -1048,7 +1048,10 @@ pub fn geohash_decode(hash: &str) -> (f64, f64, f64, f64) {
     let mut is_lon = true;
 
     for c in hash.chars() {
-        let idx = GEOHASH_CHARS.iter().position(|&x| x == c as u8).unwrap_or(0);
+        let idx = GEOHASH_CHARS
+            .iter()
+            .position(|&x| x == c as u8)
+            .unwrap_or(0);
         for i in (0..5).rev() {
             let bit = (idx >> i) & 1;
             if is_lon {

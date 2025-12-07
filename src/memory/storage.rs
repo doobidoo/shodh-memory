@@ -119,7 +119,11 @@ impl MemoryStorage {
         // BUG-001 FIX: Include memory_id in key to allow multiple memories per day
         // Old format: date:YYYYMMDD (overwrites on same day)
         // New format: date:YYYYMMDD:uuid (unique per memory)
-        let date_key = format!("date:{}:{}", memory.created_at.format("%Y%m%d"), memory.id.0);
+        let date_key = format!(
+            "date:{}:{}",
+            memory.created_at.format("%Y%m%d"),
+            memory.id.0
+        );
         batch.put(date_key.as_bytes(), b"1");
 
         // Index by type
