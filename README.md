@@ -238,8 +238,10 @@ All protected endpoints require `X-API-Key` header.
 
 | Endpoint | Method | Description | Typical Latency |
 |----------|--------|-------------|-----------------|
-| `/api/remember` | POST | Store a memory | ~30ms |
+| `/api/remember` | POST | Store memory with NER extraction | ~50ms |
 | `/api/recall` | POST | Semantic search | ~30ms |
+| `/api/recall/tags` | POST | Tag-based search (no embedding) | ~1ms |
+| `/api/recall/entities` | POST | Entity-based retrieval (NER) | ~10ms |
 | `/api/retrieve/tracked` | POST | Search with feedback tracking | ~30ms |
 | `/api/reinforce` | POST | Hebbian reinforcement feedback | ~10ms |
 | `/api/batch_remember` | POST | Store multiple memories | ~130ms/item |
