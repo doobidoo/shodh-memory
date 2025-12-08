@@ -2,6 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.varun29ankuS/shodh-memory",
   "description": "Persistent AI memory with semantic search. Store and recall context across sessions.",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png",
+      "mimeType": "image/png",
+      "sizes": "120x120"
+    },
+    {
+      "src": "https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo_32x32.png",
+      "mimeType": "image/png",
+      "sizes": "32x32"
+    }
+  ],
   "repository": {
     "url": "https://github.com/varun29ankuS/shodh-memory",
     "source": "github",

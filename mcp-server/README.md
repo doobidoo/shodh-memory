@@ -1,6 +1,10 @@
-# Shodh-Memory MCP Server
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Shodh-Memory">
+</p>
 
-Persistent AI memory with semantic search. Store observations, decisions, learnings, and recall them across sessions.
+<h1 align="center">Shodh-Memory MCP Server</h1>
+
+<p align="center">Persistent AI memory with semantic search. Store observations, decisions, learnings, and recall them across sessions.</p>
 
 ## Features
 
