@@ -13,8 +13,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::memory::types::{Experience, ExperienceType, GeoFilter, Memory};
+use crate::memory::types::{Experience, ExperienceType, ForgetCriteria, GeoFilter, Memory, MemoryId};
 use crate::memory::{MemoryConfig, MemorySystem, Query, RetrievalMode};
+use chrono::{DateTime, Utc};
 
 // ============================================================================
 // Position - Local coordinates (x, y, z in meters)
@@ -343,12 +344,14 @@ impl PyMemorySystem {
         self.mission_id.clone()
     }
 
-    // === Core Recording (Full API) ===
+    // === Core Memory API (Unified with HTTP client) ===
 
-    /// Record an experience with full robotics and decision-making support
+    /// Store a memory with full robotics and decision-making support
+    ///
+    /// This is the primary API for storing memories, matching the HTTP client's remember() method.
     #[pyo3(signature = (
         content,
-        experience_type="observation",
+        memory_type="observation",
         position=None,
         geo_location=None,
         heading=None,
@@ -369,10 +372,10 @@ impl PyMemorySystem {
         metadata=None
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn record(
+    fn remember(
         &mut self,
         content: String,
-        experience_type: &str,
+        memory_type: &str,
         position: Option<&PyPosition>,
         geo_location: Option<&PyGeoLocation>,
         heading: Option<f32>,
@@ -392,7 +395,7 @@ impl PyMemorySystem {
         entities: Option<Vec<String>>,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
-        let exp_type = match experience_type.to_lowercase().as_str() {
+        let exp_type = match memory_type.to_lowercase().as_str() {
             "observation" | "context" => ExperienceType::Context,
             "task" => ExperienceType::Task,
             "discovery" => ExperienceType::Discovery,
@@ -477,7 +480,7 @@ impl PyMemorySystem {
         geo_location: Option<&PyGeoLocation>,
         sensor_data: Option<HashMap<String, f64>>,
     ) -> PyResult<String> {
-        self.record(
+        self.remember(
             description,
             "decision",
             position,
@@ -512,7 +515,7 @@ impl PyMemorySystem {
         position: Option<&PyPosition>,
         sensor_data: Option<HashMap<String, f64>>,
     ) -> PyResult<String> {
-        self.record(
+        self.remember(
             description,
             "error",
             position,
@@ -545,7 +548,7 @@ impl PyMemorySystem {
         severity: &str,
         position: Option<&PyPosition>,
     ) -> PyResult<String> {
-        self.record(
+        self.remember(
             description,
             "discovery",
             position,
@@ -584,7 +587,7 @@ impl PyMemorySystem {
             tags.push("anomaly".to_string());
         }
 
-        self.record(
+        self.remember(
             format!("Sensor {}: {:?}", sensor_name, readings),
             if is_anomaly { "error" } else { "observation" },
             position,
@@ -626,7 +629,7 @@ impl PyMemorySystem {
             sensor_data.insert("confidence".to_string(), c);
         }
 
-        self.record(
+        self.remember(
             format!("Obstacle detected: {}", description),
             "discovery",
             position,
@@ -659,7 +662,7 @@ impl PyMemorySystem {
         position: Option<&PyPosition>,
         geo_location: Option<&PyGeoLocation>,
     ) -> PyResult<String> {
-        self.record(
+        self.remember(
             format!("Waypoint {}: {}", waypoint_id, status),
             "task",
             position,
@@ -683,12 +686,14 @@ impl PyMemorySystem {
         )
     }
 
-    // === Query Methods ===
+    // === Query Methods (Unified with HTTP client) ===
 
-    /// Retrieve memories with comprehensive filtering
+    /// Search and retrieve memories with comprehensive filtering
+    ///
+    /// This is the primary API for retrieving memories, matching the HTTP client's recall() method.
     #[pyo3(signature = (
         query,
-        max_results=10,
+        limit=10,
         mode="hybrid",
         mission_id=None,
         action_type=None,
@@ -705,10 +710,10 @@ impl PyMemorySystem {
         max_confidence=None
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn retrieve(
+    fn recall(
         &self,
         query: String,
-        max_results: usize,
+        limit: usize,
         mode: &str,
         mission_id: Option<String>,
         action_type: Option<String>,
@@ -767,7 +772,7 @@ impl PyMemorySystem {
             pattern_id,
             terrain_type,
             confidence_range,
-            max_results,
+            max_results: limit,
             retrieval_mode,
         };
 
@@ -798,7 +803,7 @@ impl PyMemorySystem {
             format!("action {}", action_type)
         };
 
-        self.retrieve(
+        self.recall(
             query_text,
             max_results,
             "action_outcome",
@@ -826,7 +831,7 @@ impl PyMemorySystem {
         severity: Option<String>,
         max_results: usize,
     ) -> PyResult<Vec<HashMap<String, PyObject>>> {
-        self.retrieve(
+        self.recall(
             "failure error problem".to_string(),
             max_results,
             "hybrid",
@@ -854,7 +859,7 @@ impl PyMemorySystem {
         max_results: usize,
     ) -> PyResult<Vec<HashMap<String, PyObject>>> {
         let tags = sensor_name.map(|s| vec![s, "anomaly".to_string()]);
-        self.retrieve(
+        self.recall(
             "anomaly unusual unexpected".to_string(),
             max_results,
             "hybrid",
@@ -881,7 +886,7 @@ impl PyMemorySystem {
         pattern_id: String,
         max_results: usize,
     ) -> PyResult<Vec<HashMap<String, PyObject>>> {
-        self.retrieve(
+        self.recall(
             format!("pattern {}", pattern_id),
             max_results,
             "hybrid",
@@ -938,6 +943,481 @@ impl PyMemorySystem {
         self.inner
             .flush_storage()
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to flush: {}", e)))
+    }
+
+    // === Context & Introspection API (Matching REST) ===
+
+    /// Get categorized context summary for session bootstrap
+    ///
+    /// Returns decisions, learnings, patterns, errors organized for LLM consumption.
+    /// Matches REST /api/context_summary endpoint.
+    #[pyo3(signature = (max_items=5, include_decisions=true, include_learnings=true, include_context=true))]
+    fn context_summary(
+        &self,
+        max_items: usize,
+        include_decisions: bool,
+        include_learnings: bool,
+        include_context: bool,
+    ) -> PyResult<HashMap<String, PyObject>> {
+        let all_memories = self
+            .inner
+            .get_all_memories()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get memories: {}", e)))?;
+
+        let total_memories = all_memories.len();
+
+        // Categorize memories by type
+        let mut decisions: Vec<(String, String, f32, String)> = Vec::new();
+        let mut learnings: Vec<(String, String, f32, String)> = Vec::new();
+        let mut context: Vec<(String, String, f32, String)> = Vec::new();
+        let mut patterns: Vec<(String, String, f32, String)> = Vec::new();
+        let mut errors: Vec<(String, String, f32, String)> = Vec::new();
+
+        for m in all_memories {
+            let item = (
+                m.id.0.to_string(),
+                m.experience.content.chars().take(200).collect(),
+                m.importance(),
+                m.created_at.to_rfc3339(),
+            );
+
+            match m.experience.experience_type {
+                ExperienceType::Decision => decisions.push(item),
+                ExperienceType::Learning => learnings.push(item),
+                ExperienceType::Context | ExperienceType::Observation => context.push(item),
+                ExperienceType::Pattern => patterns.push(item),
+                ExperienceType::Error => errors.push(item),
+                _ => context.push(item),
+            }
+        }
+
+        // Sort by importance and truncate
+        fn sort_and_truncate(
+            mut items: Vec<(String, String, f32, String)>,
+            max: usize,
+        ) -> Vec<(String, String, f32, String)> {
+            items.sort_by(|a, b| {
+                b.2.partial_cmp(&a.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            items.truncate(max);
+            items
+        }
+
+        Python::with_gil(|py| {
+            let mut result = HashMap::new();
+
+            result.insert("total_memories".to_string(), total_memories.into_py(py));
+
+            // Convert items to list of dicts
+            let to_py_list = |items: Vec<(String, String, f32, String)>| -> PyObject {
+                let list: Vec<HashMap<String, PyObject>> = items
+                    .into_iter()
+                    .map(|(id, content, importance, created_at)| {
+                        let mut item = HashMap::new();
+                        item.insert("id".to_string(), id.into_py(py));
+                        item.insert("content".to_string(), content.into_py(py));
+                        item.insert("importance".to_string(), importance.into_py(py));
+                        item.insert("created_at".to_string(), created_at.into_py(py));
+                        item
+                    })
+                    .collect();
+                list.into_py(py)
+            };
+
+            result.insert(
+                "decisions".to_string(),
+                if include_decisions {
+                    to_py_list(sort_and_truncate(decisions, max_items))
+                } else {
+                    Vec::<HashMap<String, PyObject>>::new().into_py(py)
+                },
+            );
+
+            result.insert(
+                "learnings".to_string(),
+                if include_learnings {
+                    to_py_list(sort_and_truncate(learnings, max_items))
+                } else {
+                    Vec::<HashMap<String, PyObject>>::new().into_py(py)
+                },
+            );
+
+            result.insert(
+                "context".to_string(),
+                if include_context {
+                    to_py_list(sort_and_truncate(context, max_items))
+                } else {
+                    Vec::<HashMap<String, PyObject>>::new().into_py(py)
+                },
+            );
+
+            result.insert(
+                "patterns".to_string(),
+                to_py_list(sort_and_truncate(patterns, max_items)),
+            );
+
+            result.insert(
+                "errors".to_string(),
+                to_py_list(sort_and_truncate(errors, 3.min(max_items))),
+            );
+
+            Ok(result)
+        })
+    }
+
+    /// List all memories
+    ///
+    /// Matches REST /api/list/{user_id} endpoint.
+    #[pyo3(signature = (limit=None, memory_type=None))]
+    fn list_memories(
+        &self,
+        limit: Option<usize>,
+        memory_type: Option<&str>,
+    ) -> PyResult<Vec<HashMap<String, PyObject>>> {
+        let all_memories = self
+            .inner
+            .get_all_memories()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get memories: {}", e)))?;
+
+        // Filter by type if specified
+        let filtered: Vec<_> = if let Some(type_filter) = memory_type {
+            let type_lower = type_filter.to_lowercase();
+            all_memories
+                .into_iter()
+                .filter(|m| {
+                    let mem_type = format!("{:?}", m.experience.experience_type).to_lowercase();
+                    mem_type == type_lower
+                })
+                .collect()
+        } else {
+            all_memories
+        };
+
+        // Apply limit
+        let limited: Vec<_> = if let Some(lim) = limit {
+            filtered.into_iter().take(lim).collect()
+        } else {
+            filtered
+        };
+
+        Python::with_gil(|py| {
+            limited
+                .iter()
+                .map(|mem| memory_to_dict(py, mem))
+                .collect::<PyResult<Vec<_>>>()
+        })
+    }
+
+    /// Get a single memory by ID
+    ///
+    /// Matches REST /api/memory/{id} GET endpoint.
+    fn get_memory(&self, memory_id: &str) -> PyResult<HashMap<String, PyObject>> {
+        let id = MemoryId(
+            uuid::Uuid::parse_str(memory_id)
+                .map_err(|e| PyValueError::new_err(format!("Invalid memory ID: {}", e)))?,
+        );
+
+        let memory = self
+            .inner
+            .get_memory(&id)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get memory: {}", e)))?;
+
+        Python::with_gil(|py| memory_to_dict(py, &memory))
+    }
+
+    /// Search memories by tags (no embedding needed)
+    ///
+    /// Matches REST /api/recall/tags endpoint.
+    #[pyo3(signature = (tags, limit=20))]
+    fn recall_by_tags(
+        &self,
+        tags: Vec<String>,
+        limit: usize,
+    ) -> PyResult<Vec<HashMap<String, PyObject>>> {
+        let all_memories = self
+            .inner
+            .get_all_memories()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get memories: {}", e)))?;
+
+        // Filter by tags - memory must have ANY of the provided tags
+        let filtered: Vec<_> = all_memories
+            .into_iter()
+            .filter(|m| {
+                m.experience
+                    .tags
+                    .iter()
+                    .any(|t| tags.iter().any(|search_tag| t.eq_ignore_ascii_case(search_tag)))
+            })
+            .take(limit)
+            .collect();
+
+        Python::with_gil(|py| {
+            filtered
+                .iter()
+                .map(|mem| memory_to_dict(py, mem))
+                .collect::<PyResult<Vec<_>>>()
+        })
+    }
+
+    /// Search memories by date range
+    ///
+    /// Matches REST /api/recall/date endpoint.
+    /// Dates should be ISO 8601 format (e.g., "2024-01-01T00:00:00Z")
+    #[pyo3(signature = (start, end, limit=20))]
+    fn recall_by_date(
+        &self,
+        start: &str,
+        end: &str,
+        limit: usize,
+    ) -> PyResult<Vec<HashMap<String, PyObject>>> {
+        let start_dt = chrono::DateTime::parse_from_rfc3339(start)
+            .map_err(|e| PyValueError::new_err(format!("Invalid start date: {}", e)))?
+            .with_timezone(&chrono::Utc);
+        let end_dt = chrono::DateTime::parse_from_rfc3339(end)
+            .map_err(|e| PyValueError::new_err(format!("Invalid end date: {}", e)))?
+            .with_timezone(&chrono::Utc);
+
+        let all_memories = self
+            .inner
+            .get_all_memories()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get memories: {}", e)))?;
+
+        let filtered: Vec<_> = all_memories
+            .into_iter()
+            .filter(|m| m.created_at >= start_dt && m.created_at <= end_dt)
+            .take(limit)
+            .collect();
+
+        Python::with_gil(|py| {
+            filtered
+                .iter()
+                .map(|mem| memory_to_dict(py, mem))
+                .collect::<PyResult<Vec<_>>>()
+        })
+    }
+
+    /// Get knowledge graph statistics
+    ///
+    /// Matches REST /api/graph/{user_id}/stats endpoint.
+    fn graph_stats(&self) -> PyResult<HashMap<String, PyObject>> {
+        let stats = self.inner.graph_stats();
+
+        Python::with_gil(|py| {
+            let mut dict = HashMap::new();
+            dict.insert("node_count".to_string(), stats.node_count.into_py(py));
+            dict.insert("edge_count".to_string(), stats.edge_count.into_py(py));
+            dict.insert("avg_strength".to_string(), stats.avg_strength.into_py(py));
+            dict.insert(
+                "potentiated_edges".to_string(),
+                stats.potentiated_edges.into_py(py),
+            );
+            Ok(dict)
+        })
+    }
+
+    // === Forget API (Matching REST) ===
+
+    /// Delete a single memory by ID
+    ///
+    /// Matches REST DELETE /api/memory/{id} endpoint.
+    fn forget(&self, memory_id: &str) -> PyResult<bool> {
+        // Validate the memory ID is a valid UUID
+        uuid::Uuid::parse_str(memory_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid memory ID: {}", e)))?;
+
+        // Use Pattern with exact ID match to delete by ID content
+        let deleted = self
+            .inner
+            .forget(ForgetCriteria::Pattern(format!("^{}$", memory_id)))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete memory: {}", e)))?;
+
+        Ok(deleted > 0)
+    }
+
+    /// Delete memories older than specified days
+    ///
+    /// Matches REST /api/forget/age endpoint.
+    fn forget_by_age(&self, days: u32) -> PyResult<usize> {
+        self.inner
+            .forget(ForgetCriteria::OlderThan(days))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by age: {}", e)))
+    }
+
+    /// Delete memories below importance threshold
+    ///
+    /// Matches REST /api/forget/importance endpoint.
+    fn forget_by_importance(&self, threshold: f32) -> PyResult<usize> {
+        self.inner
+            .forget(ForgetCriteria::LowImportance(threshold))
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to forget by importance: {}", e))
+            })
+    }
+
+    /// Delete memories matching regex pattern
+    ///
+    /// Matches REST /api/forget/pattern endpoint.
+    fn forget_by_pattern(&self, pattern: &str) -> PyResult<usize> {
+        self.inner
+            .forget(ForgetCriteria::Pattern(pattern.to_string()))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by pattern: {}", e)))
+    }
+
+    /// Delete memories matching any of the specified tags
+    ///
+    /// Matches REST /api/forget/tags endpoint.
+    fn forget_by_tags(&self, tags: Vec<String>) -> PyResult<usize> {
+        self.inner
+            .forget(ForgetCriteria::ByTags(tags))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by tags: {}", e)))
+    }
+
+    /// Delete memories within a date range
+    ///
+    /// Date strings should be ISO 8601 format (e.g., '2024-01-01T00:00:00Z').
+    /// Matches REST /api/forget/date endpoint.
+    fn forget_by_date(&self, start: &str, end: &str) -> PyResult<usize> {
+        let start_dt: DateTime<Utc> = start
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("Invalid start date: {}", e)))?;
+        let end_dt: DateTime<Utc> = end
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("Invalid end date: {}", e)))?;
+
+        self.inner
+            .forget(ForgetCriteria::ByDateRange {
+                start: start_dt,
+                end: end_dt,
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by date: {}", e)))
+    }
+
+    /// Delete ALL memories (GDPR compliance - right to erasure)
+    ///
+    /// Use with caution - this is irreversible.
+    fn forget_all(&self) -> PyResult<usize> {
+        self.inner
+            .forget(ForgetCriteria::All)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget all: {}", e)))
+    }
+
+    /// Get brain state visualization - shows all memories with activation levels by tier
+    ///
+    /// Returns 3-tier memory state (working, session, long-term) with activation levels.
+    /// Matches REST /api/brain/{user_id} endpoint.
+    #[pyo3(signature = (longterm_limit=100))]
+    fn brain_state(&self, longterm_limit: usize) -> PyResult<HashMap<String, PyObject>> {
+        let working_memories = self.inner.get_working_memories();
+        let session_memories = self.inner.get_session_memories();
+        let longterm_memories = self
+            .inner
+            .get_longterm_memories(longterm_limit)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to get longterm memories: {}", e)))?;
+
+        let working_count = working_memories.len();
+        let session_count = session_memories.len();
+        let longterm_count = longterm_memories.len();
+        let total_count = working_count + session_count + longterm_count;
+
+        Python::with_gil(|py| {
+            let mut result = HashMap::new();
+            let mut total_activation = 0.0f32;
+            let mut total_importance = 0.0f32;
+
+            // Convert working memories (Vec<Arc<Memory>>) to neurons
+            let working_neurons: Vec<HashMap<String, PyObject>> = working_memories
+                .iter()
+                .map(|m| {
+                    total_activation += m.activation();
+                    total_importance += m.importance();
+                    let mut neuron = HashMap::new();
+                    neuron.insert("id".to_string(), m.id.0.to_string().into_py(py));
+                    neuron.insert(
+                        "content_preview".to_string(),
+                        m.experience.content.chars().take(100).collect::<String>().into_py(py),
+                    );
+                    neuron.insert("activation".to_string(), m.activation().into_py(py));
+                    neuron.insert("importance".to_string(), m.importance().into_py(py));
+                    neuron.insert("tier".to_string(), "working".into_py(py));
+                    neuron.insert("access_count".to_string(), m.metadata_snapshot().access_count.into_py(py));
+                    neuron.insert("created_at".to_string(), m.created_at.to_rfc3339().into_py(py));
+                    neuron
+                })
+                .collect();
+
+            // Convert session memories (Vec<Arc<Memory>>) to neurons
+            let session_neurons: Vec<HashMap<String, PyObject>> = session_memories
+                .iter()
+                .map(|m| {
+                    total_activation += m.activation();
+                    total_importance += m.importance();
+                    let mut neuron = HashMap::new();
+                    neuron.insert("id".to_string(), m.id.0.to_string().into_py(py));
+                    neuron.insert(
+                        "content_preview".to_string(),
+                        m.experience.content.chars().take(100).collect::<String>().into_py(py),
+                    );
+                    neuron.insert("activation".to_string(), m.activation().into_py(py));
+                    neuron.insert("importance".to_string(), m.importance().into_py(py));
+                    neuron.insert("tier".to_string(), "session".into_py(py));
+                    neuron.insert("access_count".to_string(), m.metadata_snapshot().access_count.into_py(py));
+                    neuron.insert("created_at".to_string(), m.created_at.to_rfc3339().into_py(py));
+                    neuron
+                })
+                .collect();
+
+            // Convert longterm memories (Vec<Memory>) to neurons
+            let longterm_neurons: Vec<HashMap<String, PyObject>> = longterm_memories
+                .iter()
+                .map(|m| {
+                    total_activation += m.activation();
+                    total_importance += m.importance();
+                    let mut neuron = HashMap::new();
+                    neuron.insert("id".to_string(), m.id.0.to_string().into_py(py));
+                    neuron.insert(
+                        "content_preview".to_string(),
+                        m.experience.content.chars().take(100).collect::<String>().into_py(py),
+                    );
+                    neuron.insert("activation".to_string(), m.activation().into_py(py));
+                    neuron.insert("importance".to_string(), m.importance().into_py(py));
+                    neuron.insert("tier".to_string(), "longterm".into_py(py));
+                    neuron.insert("access_count".to_string(), m.metadata_snapshot().access_count.into_py(py));
+                    neuron.insert("created_at".to_string(), m.created_at.to_rfc3339().into_py(py));
+                    neuron
+                })
+                .collect();
+
+            result.insert("working_memory".to_string(), working_neurons.into_py(py));
+            result.insert("session_memory".to_string(), session_neurons.into_py(py));
+            result.insert("longterm_memory".to_string(), longterm_neurons.into_py(py));
+
+            // Calculate stats
+            let mut stats = HashMap::new();
+            stats.insert("total_memories".to_string(), total_count.into_py(py));
+            stats.insert("working_count".to_string(), working_count.into_py(py));
+            stats.insert("session_count".to_string(), session_count.into_py(py));
+            stats.insert("longterm_count".to_string(), longterm_count.into_py(py));
+            stats.insert(
+                "avg_activation".to_string(),
+                if total_count > 0 {
+                    (total_activation / total_count as f32).into_py(py)
+                } else {
+                    0.0f32.into_py(py)
+                },
+            );
+            stats.insert(
+                "avg_importance".to_string(),
+                if total_count > 0 {
+                    (total_importance / total_count as f32).into_py(py)
+                } else {
+                    0.0f32.into_py(py)
+                },
+            );
+            result.insert("stats".to_string(), stats.into_py(py));
+
+            Ok(result)
+        })
     }
 
     fn __repr__(&self) -> String {
