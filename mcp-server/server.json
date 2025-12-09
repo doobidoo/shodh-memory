@@ -6,12 +6,12 @@
     {
       "src": "https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png",
       "mimeType": "image/png",
-      "sizes": "120x120"
+      "sizes": ["120x120"]
     },
     {
       "src": "https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo_32x32.png",
       "mimeType": "image/png",
-      "sizes": "32x32"
+      "sizes": ["32x32"]
     }
   ],
   "repository": {
