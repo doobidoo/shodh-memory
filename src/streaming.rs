@@ -42,6 +42,68 @@ use uuid::Uuid;
 use crate::embeddings::{NerEntity, NerEntityType, NeuralNer};
 use crate::memory::{Experience, ExperienceType, MemorySystem};
 
+/// Case-insensitive substring search without allocation.
+/// Returns true if `haystack` contains `needle` (ASCII case-insensitive).
+/// `needle` MUST be lowercase ASCII for correct results.
+#[inline]
+pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle_bytes = needle.as_bytes();
+    let needle_len = needle_bytes.len();
+    if needle_len == 0 {
+        return true;
+    }
+    let haystack_bytes = haystack.as_bytes();
+    if haystack_bytes.len() < needle_len {
+        return false;
+    }
+    // Sliding window search
+    'outer: for start in 0..=(haystack_bytes.len() - needle_len) {
+        for (i, &needle_byte) in needle_bytes.iter().enumerate() {
+            if haystack_bytes[start + i].to_ascii_lowercase() != needle_byte {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Quick hash for exact deduplication (public for benchmarking).
+/// Uses case-insensitive byte-level hashing with batched writes to minimize hasher call overhead.
+#[inline]
+pub fn content_hash(content: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let trimmed = content.trim();
+    let bytes = trimmed.as_bytes();
+
+    // Process in 64-byte chunks to minimize hasher.write() calls
+    // while keeping the buffer on the stack
+    const CHUNK_SIZE: usize = 64;
+    let mut buffer: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
+
+    let mut i = 0;
+    while i + CHUNK_SIZE <= bytes.len() {
+        // Fill buffer with lowercase bytes
+        for j in 0..CHUNK_SIZE {
+            buffer[j] = bytes[i + j].to_ascii_lowercase();
+        }
+        hasher.write(&buffer);
+        i += CHUNK_SIZE;
+    }
+
+    // Handle remaining bytes
+    let remaining = bytes.len() - i;
+    if remaining > 0 {
+        for j in 0..remaining {
+            buffer[j] = bytes[i + j].to_ascii_lowercase();
+        }
+        hasher.write(&buffer[..remaining]);
+    }
+
+    hasher.finish()
+}
+
 /// Stream processing modes - determines extraction behavior
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -405,23 +467,21 @@ impl StreamSession {
         self.buffer.len() >= self.config.max_buffer_size
     }
 
-    /// Quick hash for exact deduplication
-    fn content_hash(content: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        content.to_lowercase().trim().hash(&mut hasher);
-        hasher.finish()
+    /// Quick hash for exact deduplication - delegates to public helper
+    #[inline]
+    fn hash_content(content: &str) -> u64 {
+        content_hash(content)
     }
 
     /// Check if content is duplicate (exact match)
     fn is_exact_duplicate(&self, content: &str) -> bool {
-        let hash = Self::content_hash(content);
+        let hash = Self::hash_content(content);
         self.seen_hashes.contains(&hash)
     }
 
     /// Add content hash to seen set
     fn mark_seen(&mut self, content: &str) {
-        let hash = Self::content_hash(content);
+        let hash = Self::hash_content(content);
         self.seen_hashes.insert(hash);
     }
 
@@ -846,9 +906,9 @@ impl StreamingMemoryExtractor {
                 if content.contains("```") || content.contains("fn ") || content.contains("def ") {
                     importance += 0.2;
                 }
-                // Error mentions
-                if content.to_lowercase().contains("error")
-                    || content.to_lowercase().contains("failed")
+                // Error mentions (case-insensitive without allocation)
+                if contains_ignore_ascii_case(content, "error")
+                    || contains_ignore_ascii_case(content, "failed")
                 {
                     importance += 0.2;
                 }
@@ -859,10 +919,10 @@ impl StreamingMemoryExtractor {
                 importance = 0.4;
             }
             StreamMode::Event => {
-                // Error events are most important
-                if content.to_lowercase().contains("error") {
+                // Error events are most important (case-insensitive without allocation)
+                if contains_ignore_ascii_case(content, "error") {
                     importance += 0.3;
-                } else if content.to_lowercase().contains("warning") {
+                } else if contains_ignore_ascii_case(content, "warning") {
                     importance += 0.15;
                 }
             }
@@ -873,19 +933,18 @@ impl StreamingMemoryExtractor {
 
     /// Determine experience type from mode and message
     fn determine_experience_type(mode: StreamMode, msg: &BufferedMessage) -> ExperienceType {
-        // Check tags first
+        // Check tags first (case-insensitive without allocation)
         for tag in &msg.tags {
-            let lower = tag.to_lowercase();
-            if lower.contains("error") {
+            if contains_ignore_ascii_case(tag, "error") {
                 return ExperienceType::Error;
             }
-            if lower.contains("decision") {
+            if contains_ignore_ascii_case(tag, "decision") {
                 return ExperienceType::Decision;
             }
-            if lower.contains("learning") {
+            if contains_ignore_ascii_case(tag, "learning") {
                 return ExperienceType::Learning;
             }
-            if lower.contains("discovery") {
+            if contains_ignore_ascii_case(tag, "discovery") {
                 return ExperienceType::Discovery;
             }
         }
@@ -952,9 +1011,9 @@ mod tests {
 
     #[test]
     fn test_content_hash_consistency() {
-        let h1 = StreamSession::content_hash("Hello World");
-        let h2 = StreamSession::content_hash("hello world");
-        let h3 = StreamSession::content_hash("  hello world  ");
+        let h1 = content_hash("Hello World");
+        let h2 = content_hash("hello world");
+        let h3 = content_hash("  hello world  ");
 
         // Should be case-insensitive and trim-aware
         assert_eq!(h1, h2);

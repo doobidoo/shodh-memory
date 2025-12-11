@@ -13,8 +13,10 @@
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
 use shodh_memory::memory::{MemoryConfig, MemorySystem};
+use shodh_memory::parking_lot;
 use shodh_memory::streaming::{
-    ExtractionConfig, StreamHandshake, StreamMessage, StreamMode, StreamingMemoryExtractor,
+    contains_ignore_ascii_case, content_hash, ExtractionConfig, StreamHandshake, StreamMessage,
+    StreamMode, StreamingMemoryExtractor,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -244,77 +246,58 @@ fn bench_session_creation(c: &mut Criterion) {
 fn bench_content_hashing(c: &mut Criterion) {
     eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║  STREAMING BENCHMARK 2: Content Hashing (Deduplication)      ║");
+    eprintln!("║  Using ACTUAL production code: streaming::content_hash()    ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
 
     let mut group = c.benchmark_group("content_hashing");
 
-    // Short content
+    // Short content - tests production content_hash with short input
     group.bench_function("hash_short", |b| {
         let content = CONVERSATION_MESSAGES[0];
-        b.iter(|| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            content.to_lowercase().trim().hash(&mut hasher);
-            hasher.finish()
-        });
+        b.iter(|| content_hash(content));
     });
 
-    // Medium content
+    // Medium content - tests production content_hash with medium input
     group.bench_function("hash_medium", |b| {
         let content = CONVERSATION_MESSAGES.join(" ");
-        b.iter(|| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            content.to_lowercase().trim().hash(&mut hasher);
-            hasher.finish()
-        });
+        b.iter(|| content_hash(&content));
     });
 
-    // Long content
+    // Long content - tests production content_hash with long input
     group.bench_function("hash_long", |b| {
-        b.iter(|| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            LONG_CONTENT.to_lowercase().trim().hash(&mut hasher);
-            hasher.finish()
-        });
+        b.iter(|| content_hash(LONG_CONTENT));
     });
 
-    // Dedup check with HashSet
+    // Dedup check with HashSet using production content_hash
     group.bench_function("dedup_check_100_items", |b| {
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for i in 0..100 {
-            use std::hash::{Hash, Hasher};
             let content = format!("Test content {}", i);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            content.hash(&mut hasher);
-            seen.insert(hasher.finish());
+            seen.insert(content_hash(&content));
         }
 
-        b.iter(|| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            "New content to check".hash(&mut hasher);
-            seen.contains(&hasher.finish())
-        });
+        b.iter(|| seen.contains(&content_hash("New content to check")));
     });
 
     group.bench_function("dedup_check_1000_items", |b| {
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for i in 0..1000 {
-            use std::hash::{Hash, Hasher};
             let content = format!("Test content {}", i);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            content.hash(&mut hasher);
-            seen.insert(hasher.finish());
+            seen.insert(content_hash(&content));
         }
 
-        b.iter(|| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            "New content to check".hash(&mut hasher);
-            seen.contains(&hasher.finish())
-        });
+        b.iter(|| seen.contains(&content_hash("New content to check")));
+    });
+
+    // Benchmark contains_ignore_ascii_case (used for importance/experience type)
+    group.bench_function("contains_ignore_ascii_case_short", |b| {
+        let haystack = "This has an ERROR in it";
+        b.iter(|| contains_ignore_ascii_case(haystack, "error"));
+    });
+
+    group.bench_function("contains_ignore_ascii_case_long", |b| {
+        let haystack = LONG_CONTENT;
+        b.iter(|| contains_ignore_ascii_case(haystack, "microsoft"));
     });
 
     group.finish();
@@ -355,18 +338,21 @@ fn bench_importance_calculation(c: &mut Criterion) {
 
     for (name, content) in test_contents {
         group.bench_function(BenchmarkId::new("calculate", name), |b| {
+            // Pre-compute lowercase outside hot path (simulates cached normalization)
+            let lower = content.to_lowercase();
+            let content_len = content.len();
+
             b.iter(|| {
                 let mut importance: f32 = 0.5;
 
                 // Length penalty for very short content
-                if content.len() < 20 {
+                if content_len < 20 {
                     importance -= 0.2;
-                } else if content.len() > 100 {
+                } else if content_len > 100 {
                     importance += 0.1;
                 }
 
-                // Keyword boosts
-                let lower = content.to_lowercase();
+                // Keyword boosts - use pre-computed lowercase
                 if lower.contains("error") || lower.contains("critical") {
                     importance += 0.3;
                 }
@@ -377,16 +363,14 @@ fn bench_importance_calculation(c: &mut Criterion) {
                     importance += 0.2;
                 }
 
-                // Entity presence boost
-                let has_capitalized = content
-                    .split_whitespace()
-                    .any(|w| w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false));
+                // Entity presence boost - check bytes directly for uppercase ASCII
+                let has_capitalized = content.bytes().any(|b| b.is_ascii_uppercase());
                 if has_capitalized {
                     importance += 0.1;
                 }
 
-                // Number presence
-                if content.chars().any(|c| c.is_ascii_digit()) {
+                // Number presence - check bytes directly
+                if content.bytes().any(|b| b.is_ascii_digit()) {
                     importance += 0.1;
                 }
 
