@@ -23,7 +23,7 @@ import {
 
 // Configuration
 const API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
-const API_KEY = process.env.SHODH_API_KEY || "shodh-dev-key-change-in-production";
+const API_KEY = process.env.SHODH_API_KEY || "sk-shodh-dev-4f8b2c1d9e3a7f5b6d2c8e4a1b9f7d3c";
 const USER_ID = process.env.SHODH_USER_ID || "claude-code";
 const RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1000;
@@ -380,7 +380,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "proactive_context",
-        description: "Surface relevant memories based on current conversation context. Use this proactively during conversations to retrieve memories that might be relevant to the current discussion without needing an explicit query. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories.",
+        description: "Surface relevant memories based on current conversation context AND automatically store the context for future recall. Use this proactively during conversations to: (1) retrieve memories relevant to the current discussion, and (2) build persistent memory of the conversation. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories. Auto-ingest is enabled by default - set auto_ingest=false to disable.",
         inputSchema: {
           type: "object",
           properties: {
@@ -412,6 +412,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "array",
               items: { type: "string" },
               description: "Filter to specific memory types (e.g., ['Decision', 'Learning', 'Context']). Empty means all types.",
+            },
+            auto_ingest: {
+              type: "boolean",
+              description: "Automatically store the context as a Conversation memory (default: true). Set to false to only surface memories without storing.",
+              default: true,
             },
           },
           required: ["context"],
@@ -901,6 +906,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           recency_weight = 0.2,
           max_results = 5,
           memory_types = [],
+          auto_ingest = true,
         } = args as {
           context: string;
           semantic_threshold?: number;
@@ -908,7 +914,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           recency_weight?: number;
           max_results?: number;
           memory_types?: string[];
+          auto_ingest?: boolean;
         };
+
+        // Auto-ingest: Store conversation context as a memory (fire and forget)
+        // Only ingest if context is substantial (> 100 chars) to avoid noise
+        if (auto_ingest && context.length > 100) {
+          apiCall<{ memory_id: string }>("/api/record", "POST", {
+            user_id: USER_ID,
+            experience: {
+              content: context.slice(0, 2000), // Limit to 2000 chars per memory
+              experience_type: "Conversation",
+              tags: ["auto-ingest", "proactive-context"],
+            },
+          }).catch(() => {}); // Silently ignore failures - don't block surfacing
+        }
 
         interface DetectedEntity {
           text: string;
