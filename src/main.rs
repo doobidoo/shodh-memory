@@ -55,7 +55,6 @@ use memory::{
     ActivatedMemory, Experience, ExperienceType, GraphStats as VisualizationStats, Memory,
     MemoryConfig, MemoryId, MemoryStats, MemorySystem, Query as MemoryQuery, SharedMemory,
 };
-use similarity::top_k_similar;
 
 /// Audit event for history tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -884,26 +883,17 @@ struct RecordRequest {
 
 #[derive(Debug, Serialize)]
 struct RecordResponse {
-    memory_id: String,
+    id: String,
     success: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct RetrieveRequest {
-    user_id: String,
-    #[serde(alias = "query")]
-    query_text: Option<String>,
-    query_embedding: Option<Vec<f32>>,
-    #[serde(alias = "limit")]
-    max_results: Option<usize>,
-    importance_threshold: Option<f32>,
-}
-
+/// Response for list/search operations returning multiple memories
 #[derive(Debug, Serialize)]
 struct RetrieveResponse {
     memories: Vec<Memory>,
     count: usize,
 }
+
 
 // MemoryStats is imported from memory::types - has more fields than we need here
 
@@ -1691,7 +1681,7 @@ async fn record_experience(
         .inc();
 
     Ok(Json(RecordResponse {
-        memory_id: memory_id.0.to_string(),
+        id: memory_id.0.to_string(),
         success: true,
     }))
 }
@@ -2154,7 +2144,7 @@ async fn linear_webhook(
 
     Ok(Json(serde_json::json!({
         "status": "success",
-        "memory_id": memory_id.0.to_string(),
+        "id": memory_id.0.to_string(),
         "external_id": external_id,
         "was_update": was_update,
         "action": payload.action
@@ -2420,7 +2410,7 @@ async fn github_webhook(
 
     Ok(Json(serde_json::json!({
         "status": "success",
-        "memory_id": memory_id.0.to_string(),
+        "id": memory_id.0.to_string(),
         "external_id": external_id,
         "was_update": was_update,
         "action": payload.action,
@@ -3928,326 +3918,6 @@ async fn batch_remember(
     }))
 }
 
-/// Retrieve memories
-#[tracing::instrument(skip(state), fields(user_id = %req.user_id, query_text = ?req.query_text))]
-async fn retrieve_memories(
-    State(state): State<AppState>,
-    Json(req): Json<RetrieveRequest>,
-) -> Result<Json<RetrieveResponse>, AppError> {
-    // P1.2: Instrument memory retrieve operation
-    let retrieve_start = std::time::Instant::now();
-    let retrieval_mode = "hybrid"; // Default mode
-
-    // Enterprise input validation
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-
-    if let Some(ref emb) = req.query_embedding {
-        validation::validate_embeddings(emb)
-            .map_err(|e| AppError::InvalidEmbeddings(e.to_string()))?;
-    }
-
-    let max_results = req.max_results.unwrap_or(10);
-    validation::validate_max_results(max_results).map_validation_err("max_results")?;
-
-    if let Some(threshold) = req.importance_threshold {
-        validation::validate_importance_threshold(threshold)
-            .map_validation_err("importance_threshold")?;
-    }
-
-    let memory = state
-        .get_user_memory(&req.user_id)
-        .map_err(AppError::Internal)?;
-
-    // CRITICAL FIX: Wrap blocking I/O in spawn_blocking
-    // retrieve() does:
-    // - ONNX inference for query embedding (10-50ms)
-    // - RocksDB reads for memory lookups (100µs-10ms per memory)
-    // - Graph traversal with multiple storage operations
-    // Running these on async threads starves the Tokio runtime under load
-    let memories: Vec<Memory> = {
-        let memory = memory.clone();
-        let query_text = req.query_text.clone();
-        let query_embedding = req.query_embedding.clone();
-        let state_clone = state.clone();
-        let user_id = req.user_id.clone();
-        let importance_threshold = req.importance_threshold;
-        let max_results_val = req.max_results;
-
-        tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-
-            let query = MemoryQuery {
-                query_text: query_text.clone(),
-                query_embedding: query_embedding.clone(),
-                max_results,
-                importance_threshold,
-                ..Default::default()
-            };
-
-            // HYBRID RETRIEVAL: Semantic + Graph Boost
-            // 1. Semantic similarity is the base score (content matching)
-            // 2. Graph activation provides boost for entity-related memories
-            // Formula: final_score = semantic_score * (1.0 + graph_boost)
-            let memories: Vec<Memory> = if let Some(ref query_text) = query_text {
-                // Step 1: Generate query embedding
-                let query_embedding = memory_guard
-                    .get_embedder()
-                    .encode(query_text)
-                    .map_err(AppError::Internal)?;
-
-                // Step 2: Extract entities from query for graph lookup using Neural NER
-                let query_entities: Vec<(String, NerEntityType)> =
-                    match state_clone.neural_ner.extract(query_text) {
-                        Ok(entities) => entities
-                            .into_iter()
-                            .map(|e| (e.text, e.entity_type))
-                            .collect(),
-                        Err(e) => {
-                            tracing::debug!("NER extraction failed in hybrid recall: {}", e);
-                            Vec::new()
-                        }
-                    };
-
-                // Step 3: Build entity activation map from graph
-                // This gives us activated memory IDs and their graph scores
-                let mut memory_graph_boosts: std::collections::HashMap<uuid::Uuid, f32> =
-                    std::collections::HashMap::new();
-
-                // =================================================================
-                // SPREADING ACTIVATION (Anderson & Pirolli 1984)
-                // Multi-hop activation with exponential decay
-                // =================================================================
-                const DECAY_RATE: f32 = 0.5; // λ: decay rate per hop
-                const MAX_HOPS: usize = 3; // Maximum traversal depth
-
-                if !query_entities.is_empty() {
-                    if let Ok(graph) = state_clone.get_user_graph(&user_id) {
-                        let graph_guard = graph.read();
-
-                        // Track visited entities to avoid cycles
-                        let mut visited_entities: std::collections::HashSet<uuid::Uuid> =
-                            std::collections::HashSet::new();
-
-                        // Initialize activation from query entities (hop 0)
-                        let mut current_level: Vec<(uuid::Uuid, f32)> = Vec::new();
-
-                        for (entity_name, _) in &query_entities {
-                            if let Ok(Some(entity_node)) =
-                                graph_guard.find_entity_by_name(entity_name)
-                            {
-                                // Initial activation = entity salience (IC weight)
-                                let initial_activation = entity_node.salience;
-                                current_level.push((entity_node.uuid, initial_activation));
-                                visited_entities.insert(entity_node.uuid);
-
-                                // Hop 0: Direct episodes get full activation
-                                if let Ok(episodes) =
-                                    graph_guard.get_episodes_by_entity(&entity_node.uuid)
-                                {
-                                    for episode in episodes {
-                                        let boost = initial_activation * 0.5;
-                                        *memory_graph_boosts.entry(episode.uuid).or_insert(0.0) +=
-                                            boost;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Spread activation through hops 1 to MAX_HOPS
-                        for hop in 1..=MAX_HOPS {
-                            if current_level.is_empty() {
-                                break;
-                            }
-
-                            // Decay factor: A(d) = A₀ × e^(-λd)
-                            let decay = (-DECAY_RATE * hop as f32).exp();
-                            let mut next_level: Vec<(uuid::Uuid, f32)> = Vec::new();
-
-                            for (entity_uuid, activation) in &current_level {
-                                // Spread to connected entities via edges
-                                if let Ok(edges) = graph_guard.get_entity_relationships(entity_uuid)
-                                {
-                                    for edge in edges {
-                                        let connected_uuid = if edge.from_entity == *entity_uuid {
-                                            edge.to_entity
-                                        } else {
-                                            edge.from_entity
-                                        };
-
-                                        // Skip already visited entities
-                                        if visited_entities.contains(&connected_uuid) {
-                                            continue;
-                                        }
-                                        visited_entities.insert(connected_uuid);
-
-                                        // Spread activation = parent × edge_strength × decay
-                                        let spread_activation = activation * edge.strength * decay;
-
-                                        // Get connected entity's salience for weighting
-                                        let connected_salience = graph_guard
-                                            .get_entity(&connected_uuid)
-                                            .ok()
-                                            .flatten()
-                                            .map(|e| e.salience)
-                                            .unwrap_or(0.3);
-
-                                        // Boost connected episodes with spread activation
-                                        if let Ok(connected_episodes) =
-                                            graph_guard.get_episodes_by_entity(&connected_uuid)
-                                        {
-                                            for episode in connected_episodes {
-                                                // Boost = spread_activation × connected_salience
-                                                let boost =
-                                                    spread_activation * connected_salience * 0.5;
-                                                *memory_graph_boosts
-                                                    .entry(episode.uuid)
-                                                    .or_insert(0.0) += boost;
-                                            }
-                                        }
-
-                                        // Add to next level for further spreading
-                                        next_level.push((
-                                            connected_uuid,
-                                            spread_activation * connected_salience,
-                                        ));
-                                    }
-                                }
-                            }
-
-                            // Move to next level
-                            current_level = next_level;
-                        }
-                    }
-                }
-
-                // Step 4: Get all memories and compute hybrid scores
-                let all_memories = memory_guard
-                    .get_all_memories()
-                    .map_err(AppError::Internal)?;
-
-                // Step 5: Score each memory by semantic + graph boost
-                let mut scored_memories: Vec<(f32, Memory)> = all_memories
-                    .into_iter()
-                    .filter_map(|shared_mem| {
-                        let memory = (*shared_mem).clone();
-
-                        // Get embedding
-                        let mem_embedding = if let Some(emb) = &memory.experience.embeddings {
-                            emb.clone()
-                        } else {
-                            return None;
-                        };
-
-                        // Compute cosine similarity (base score)
-                        let semantic_score = cosine_similarity(&query_embedding, &mem_embedding);
-
-                        // Get graph boost (if any) - use UUID directly (memory.id.0 is already Uuid)
-                        let graph_boost = memory_graph_boosts
-                            .get(&memory.id.0)
-                            .copied()
-                            .unwrap_or(0.0)
-                            .min(1.0); // Cap boost at 100%
-
-                        // Hybrid score: semantic * (1 + graph_boost)
-                        // This ensures semantic match is primary, graph only boosts
-                        let final_score = semantic_score * (1.0 + graph_boost);
-
-                        Some((final_score, memory))
-                    })
-                    .collect();
-
-                // Step 6: Sort by final hybrid score (descending)
-                scored_memories
-                    .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-                // Step 7: Take top-k and set scores
-                scored_memories
-                    .into_iter()
-                    .take(query.max_results)
-                    .map(|(score, mut mem)| {
-                        mem.score = Some(score);
-                        mem
-                    })
-                    .collect()
-            } else {
-                // Fallback to traditional retrieval
-                let shared_memories = memory_guard.retrieve(&query).map_err(AppError::Internal)?;
-
-                // Convert Arc<Memory> to owned Memory
-                let mut memories: Vec<Memory> =
-                    shared_memories.iter().map(|m| (**m).clone()).collect();
-
-                // If query embedding provided, re-rank by semantic similarity
-                if let Some(query_emb) = &query_embedding {
-                    let candidates: Vec<(Vec<f32>, &Memory)> = memories
-                        .iter()
-                        .filter_map(|m| {
-                            m.experience.embeddings.as_ref().map(|emb| (emb.clone(), m))
-                        })
-                        .collect();
-
-                    let ranked =
-                        top_k_similar(query_emb, &candidates, max_results_val.unwrap_or(10));
-
-                    // Create new vec with scores populated
-                    ranked
-                        .into_iter()
-                        .map(|(score, m)| {
-                            let mut mem = m.clone();
-                            mem.score = Some(score);
-                            mem
-                        })
-                        .collect()
-                } else {
-                    // Populate scores based on importance * temporal_relevance
-                    for memory in &mut memories {
-                        memory.score = Some(memory.importance() * memory.temporal_relevance());
-                    }
-                    memories
-                }
-            };
-
-            Ok::<Vec<Memory>, AppError>(memories)
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
-        .map_err(|e: AppError| e)?
-    };
-
-    let count = memories.len();
-
-    // Record retrieve metrics (no user_id to prevent cardinality explosion)
-    let duration = retrieve_start.elapsed().as_secs_f64();
-    metrics::MEMORY_RETRIEVE_DURATION
-        .with_label_values(&[retrieval_mode])
-        .observe(duration);
-    metrics::MEMORY_RETRIEVE_TOTAL
-        .with_label_values(&[retrieval_mode, "success"])
-        .inc();
-    metrics::MEMORY_RETRIEVE_RESULTS
-        .with_label_values(&[retrieval_mode])
-        .observe(count as f64);
-
-    // SSE: Emit real-time event for dashboard (only if results found)
-    if count > 0 {
-        state.emit_event(MemoryEvent {
-            event_type: "RETRIEVE".to_string(),
-            timestamp: chrono::Utc::now(),
-            user_id: req.user_id.clone(),
-            memory_id: None,
-            content_preview: req
-                .query_text
-                .as_ref()
-                .map(|q| q.chars().take(100).collect()),
-            memory_type: None,
-            importance: None,
-            count: Some(count),
-        });
-    }
-
-    Ok(Json(RetrieveResponse { memories, count }))
-}
-
 /// Get user statistics
 async fn get_user_stats(
     State(state): State<AppState>,
@@ -5395,7 +5065,7 @@ async fn patch_memory(
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "memory_id": memory_id,
+        "id": memory_id,
         "updated_fields": changes
     })))
 }
