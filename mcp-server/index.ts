@@ -190,15 +190,19 @@ connectStream().catch((err) => {
 });
 
 // Types matching the Rust API response structure
+// Note: API returns memory_type in simplified responses, experience_type in legacy
 interface Experience {
   content: string;
-  experience_type?: string;
+  memory_type?: string;
+  experience_type?: string; // legacy alias
   tags?: string[];
 }
 
 interface Memory {
   id: string;
-  experience: Experience;
+  experience?: Experience;
+  content?: string; // flat format from simplified API
+  memory_type?: string; // flat format from simplified API
   score?: number;
   created_at?: string;
   importance?: number;
@@ -210,14 +214,14 @@ interface ApiResponse<T> {
   error?: string;
 }
 
-// Helper: Get content from memory (handles nested structure)
+// Helper: Get content from memory (handles nested and flat structure)
 function getContent(m: Memory): string {
-  return m.experience?.content || '';
+  return m.content || m.experience?.content || '';
 }
 
-// Helper: Get experience type from memory
+// Helper: Get memory type from memory (handles both formats)
 function getType(m: Memory): string {
-  return m.experience?.experience_type || 'Observation';
+  return m.memory_type || m.experience?.memory_type || m.experience?.experience_type || 'Observation';
 }
 
 // Helper: Sleep for retry delays
@@ -724,20 +728,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tags?: string[];
         };
 
-        const result = await apiCall<{ memory_id: string }>("/api/record", "POST", {
+        const result = await apiCall<{ id: string }>("/api/remember", "POST", {
           user_id: USER_ID,
-          experience: {
-            content,
-            experience_type: type,
-            tags,
-          },
+          content,
+          memory_type: type,
+          tags,
         });
 
         return {
           content: [
             {
               type: "text",
-              text: `Remembered: "${content.slice(0, 50)}${content.length > 50 ? '...' : ''}"\nMemory ID: ${result.memory_id}`,
+              text: `Remembered: "${content.slice(0, 50)}${content.length > 50 ? '...' : ''}"\nMemory ID: ${result.id}`,
             },
           ],
         };

@@ -344,19 +344,20 @@ class Memory:
             ShodhRateLimitError: If rate limit is exceeded
             ShodhServerError: If server encounters an error
         """
-        experience = Experience(
-            content=content,
-            experience_type=experience_type,
-            entities=entities or [],
-            metadata=metadata or {}
-        )
+        # Build tags from entities and metadata
+        tags = list(entities or [])
+        if metadata and "tags" in metadata:
+            # Support comma-separated tags in metadata
+            tags.extend([t.strip() for t in metadata["tags"].split(",") if t.strip()])
 
         try:
             response = self._session.post(
-                f"{self.base_url}/api/record",
+                f"{self.base_url}/api/remember",
                 json={
                     "user_id": self.user_id,
-                    "experience": experience.to_dict()
+                    "content": content,
+                    "memory_type": experience_type.capitalize(),
+                    "tags": tags
                 },
                 timeout=self.timeout
             )
@@ -366,7 +367,7 @@ class Memory:
             raise ShodhError(f"Request timed out: {e}") from e
 
         _handle_response_error(response, context="add memory")
-        return response.json()["memory_id"]
+        return response.json()["id"]
 
     def search(
         self,
@@ -788,9 +789,11 @@ class Memory:
         errors = []
 
         for m in memories:
+            # Handle both nested experience format and flat format
             exp = m.get("experience", {})
-            exp_type = exp.get("experience_type", "Observation")
-            content = exp.get("content", "")
+            # Check memory_type first (new format), then experience.experience_type (legacy)
+            exp_type = m.get("memory_type") or exp.get("memory_type") or exp.get("experience_type", "Observation")
+            content = m.get("content") or exp.get("content", "")
 
             item = {
                 "id": m.get("id", ""),

@@ -74,7 +74,7 @@ pub struct MemoryEvent {
     pub user_id: String,
     pub memory_id: Option<String>,
     pub content_preview: Option<String>, // First 100 chars
-    pub experience_type: Option<String>,
+    pub memory_type: Option<String>,
     pub importance: Option<f32>,
     pub count: Option<usize>, // For retrieve events - number of results
 }
@@ -929,9 +929,9 @@ struct RememberRequest {
     content: String,
     #[serde(default)]
     tags: Vec<String>,
-    /// Accept both "experience_type" and "memory_type" as field names
-    #[serde(default, alias = "memory_type")]
-    experience_type: Option<String>,
+    /// Accept both "memory_type" and "experience_type" as field names
+    #[serde(default, alias = "experience_type")]
+    memory_type: Option<String>,
     /// External ID for linking to external systems (e.g., "linear:SHO-39", "github:pr-123")
     /// When provided with upsert, existing memory with same external_id will be updated
     #[serde(default)]
@@ -993,7 +993,7 @@ struct RecallMemory {
 struct RecallExperience {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    experience_type: Option<String>,
+    memory_type: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
 }
@@ -1010,8 +1010,8 @@ struct BatchMemoryItem {
     content: String,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
-    experience_type: Option<String>,
+    #[serde(default, alias = "experience_type")]
+    memory_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1030,8 +1030,8 @@ struct UpsertRequest {
     content: String,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default, alias = "memory_type")]
-    experience_type: Option<String>,
+    #[serde(default, alias = "experience_type")]
+    memory_type: Option<String>,
     /// Type of change: "content_updated", "status_changed", "tags_updated", "importance_adjusted"
     #[serde(default = "default_change_type")]
     change_type: String,
@@ -1678,7 +1678,7 @@ async fn record_experience(
         user_id: req.user_id.clone(),
         memory_id: Some(memory_id.0.to_string()),
         content_preview: Some(req.experience.content.chars().take(100).collect()),
-        experience_type: Some(format!("{:?}", req.experience.experience_type)),
+        memory_type: Some(format!("{:?}", req.experience.experience_type)),
         importance: req.experience.reward, // Map reward to importance for display
         count: None,
     });
@@ -1713,9 +1713,9 @@ async fn remember(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
 
-    // Parse experience type from string, default to Context
+    // Parse memory type from string, default to Context
     let experience_type = req
-        .experience_type
+        .memory_type
         .as_ref()
         .and_then(|s| match s.to_lowercase().as_str() {
             "task" => Some(ExperienceType::Task),
@@ -1829,9 +1829,9 @@ async fn upsert_memory(
         });
     }
 
-    // Parse experience type
+    // Parse memory type
     let experience_type = req
-        .experience_type
+        .memory_type
         .as_ref()
         .and_then(|s| match s.to_lowercase().as_str() {
             "task" => Some(ExperienceType::Task),
@@ -2754,7 +2754,7 @@ async fn recall(
                     id: m.id.0.to_string(),
                     experience: RecallExperience {
                         content: m.experience.content.clone(),
-                        experience_type: Some(format!("{:?}", m.experience.experience_type)),
+                        memory_type: Some(format!("{:?}", m.experience.experience_type)),
                         tags: m.experience.entities.clone(),
                     },
                     importance: m.importance(),
@@ -2935,7 +2935,7 @@ async fn recall(
             id: m.id.0.to_string(),
             experience: RecallExperience {
                 content: m.experience.content.clone(),
-                experience_type: Some(format!("{:?}", m.experience.experience_type)),
+                memory_type: Some(format!("{:?}", m.experience.experience_type)),
                 tags: m.experience.entities.clone(),
             },
             importance: m.importance(),
@@ -3634,7 +3634,7 @@ async fn recall_tracked(
                 id: m.id.0.to_string(),
                 experience: RecallExperience {
                     content: m.experience.content.clone(),
-                    experience_type: Some(format!("{:?}", m.experience.experience_type)),
+                    memory_type: Some(format!("{:?}", m.experience.experience_type)),
                     tags: m.experience.entities.clone(),
                 },
                 importance: m.importance(),
@@ -3871,7 +3871,7 @@ async fn batch_remember(
 
             for item in items {
                 let experience_type = item
-                    .experience_type
+                    .memory_type
                     .as_ref()
                     .and_then(|s| match s.to_lowercase().as_str() {
                         "task" => Some(ExperienceType::Task),
@@ -4239,7 +4239,7 @@ async fn retrieve_memories(
                 .query_text
                 .as_ref()
                 .map(|q| q.chars().take(100).collect()),
-            experience_type: None,
+            memory_type: None,
             importance: None,
             count: Some(count),
         });
