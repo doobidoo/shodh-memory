@@ -373,7 +373,7 @@ class Memory:
         self,
         query: Optional[str] = None,
         query_embedding: Optional[List[float]] = None,
-        max_results: int = 10,
+        limit: int = 10,
         importance_threshold: Optional[float] = None
     ) -> List[dict]:
         """Search memories
@@ -381,7 +381,7 @@ class Memory:
         Args:
             query: Text query (keyword search)
             query_embedding: Query embedding vector for semantic search
-            max_results: Maximum number of results
+            limit: Maximum number of results
             importance_threshold: Minimum importance score (0.0 - 1.0)
 
         Returns:
@@ -420,7 +420,7 @@ class Memory:
                 json={
                     "user_id": self.user_id,
                     "query": query or "",
-                    "limit": max_results,
+                    "limit": limit,
                     "mode": "hybrid"
                 },
                 timeout=self.timeout
@@ -605,7 +605,178 @@ class Memory:
             raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
 
         _handle_response_error(response, context=f"delete user {self.user_id}")
-        print(f"🧠 All memories deleted for user: {self.user_id}")
+        print(f"All memories deleted for user: {self.user_id}")
+
+    def forget_by_age(self, days: int) -> int:
+        """Delete memories older than specified days
+
+        Args:
+            days: Delete memories older than this many days
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete memories older than 30 days
+            count = memory.forget_by_age(30)
+            print(f"Deleted {count} old memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/age",
+                json={"user_id": self.user_id, "days_old": days},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by age")
+        return response.json()["forgotten_count"]
+
+    def forget_by_importance(self, threshold: float) -> int:
+        """Delete memories below importance threshold
+
+        Args:
+            threshold: Delete memories with importance below this value (0.0-1.0)
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete unimportant memories
+            count = memory.forget_by_importance(0.3)
+            print(f"Deleted {count} low-importance memories")
+        """
+        if not 0.0 <= threshold <= 1.0:
+            raise ShodhValidationError("threshold must be between 0.0 and 1.0", field="threshold")
+
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/importance",
+                json={"user_id": self.user_id, "threshold": threshold},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by importance")
+        return response.json()["forgotten_count"]
+
+    def forget_by_pattern(self, pattern: str) -> int:
+        """Delete memories matching a regex pattern
+
+        Args:
+            pattern: Regex pattern to match against memory content
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete all memories containing "test"
+            count = memory.forget_by_pattern(r"test.*")
+            print(f"Deleted {count} test memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/pattern",
+                json={"user_id": self.user_id, "pattern": pattern},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by pattern")
+        return response.json()["forgotten_count"]
+
+    def forget_by_tags(self, tags: List[str]) -> int:
+        """Delete memories matching any of the specified tags
+
+        Args:
+            tags: List of tags to match (OR logic)
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete all temporary memories
+            count = memory.forget_by_tags(["temp", "draft"])
+            print(f"Deleted {count} tagged memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/tags",
+                json={"user_id": self.user_id, "tags": tags},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by tags")
+        return response.json()["forgotten_count"]
+
+    def forget_by_date(self, start: str, end: str) -> int:
+        """Delete memories within a date range
+
+        Args:
+            start: Start date (ISO 8601 format, e.g., '2024-01-01T00:00:00Z')
+            end: End date (ISO 8601 format, e.g., '2024-12-31T23:59:59Z')
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete memories from January 2024
+            count = memory.forget_by_date(
+                "2024-01-01T00:00:00Z",
+                "2024-01-31T23:59:59Z"
+            )
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/date",
+                json={"user_id": self.user_id, "start": start, "end": end},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by date")
+        return response.json()["forgotten_count"]
+
+    def batch_remember(
+        self,
+        memories: List[Dict[str, any]]
+    ) -> Dict[str, any]:
+        """Store multiple memories in a single request
+
+        Args:
+            memories: List of memory dicts, each with:
+                - content (str, required): The content to remember
+                - memory_type (str, optional): Type (Decision, Learning, etc.)
+                - tags (list, optional): Tags for categorization
+
+        Returns:
+            Dict with ids (list of created IDs), success_count, error_count
+
+        Examples:
+            result = memory.batch_remember([
+                {"content": "User prefers dark mode", "memory_type": "Decision"},
+                {"content": "API rate limit is 100/min", "memory_type": "Learning"},
+                {"content": "Meeting at 3pm", "tags": ["calendar"]}
+            ])
+            print(f"Created {result['success_count']} memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/batch_remember",
+                json={"user_id": self.user_id, "memories": memories},
+                timeout=self.timeout * 2  # Double timeout for batch
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise ShodhConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="batch remember")
+        return response.json()
 
     def visualize(self, open_browser: bool = True) -> str:
         """Open memory visualization dashboard in browser
