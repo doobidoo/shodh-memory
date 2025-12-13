@@ -894,7 +894,6 @@ struct RetrieveResponse {
     count: usize,
 }
 
-
 // MemoryStats is imported from memory::types - has more fields than we need here
 
 #[derive(Debug, Serialize)]
