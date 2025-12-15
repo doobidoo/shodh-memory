@@ -1189,11 +1189,74 @@ impl MemorySystem {
         let regex = crate::validation::validate_and_compile_pattern(pattern)
             .map_err(|e| anyhow::anyhow!("Invalid pattern: {e}"))?;
         let mut count = 0;
+        let mut working_removed = 0;
+        let mut session_removed = 0;
+        let mut long_term_removed = 0;
 
-        // Remove from all tiers
-        count += self.working_memory.write().remove_matching(&regex)?;
-        count += self.session_memory.write().remove_matching(&regex)?;
-        count += self.long_term_memory.remove_matching(&regex)?;
+        // Collect IDs from working memory that match
+        let working_ids: Vec<MemoryId> = {
+            let working = self.working_memory.read();
+            working
+                .all_memories()
+                .iter()
+                .filter(|m| regex.is_match(&m.experience.content))
+                .map(|m| m.id.clone())
+                .collect()
+        };
+        // Remove from working memory and vector index
+        {
+            let mut working = self.working_memory.write();
+            for id in &working_ids {
+                if working.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    working_removed += 1;
+                    count += 1;
+                }
+            }
+        }
+
+        // Collect IDs from session memory that match
+        let session_ids: Vec<MemoryId> = {
+            let session = self.session_memory.read();
+            session
+                .all_memories()
+                .iter()
+                .filter(|m| regex.is_match(&m.experience.content))
+                .map(|m| m.id.clone())
+                .collect()
+        };
+        // Remove from session memory and vector index
+        {
+            let mut session = self.session_memory.write();
+            for id in &session_ids {
+                if session.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    session_removed += 1;
+                    count += 1;
+                }
+            }
+        }
+
+        // Remove from long-term memory
+        let all_lt = self.long_term_memory.get_all()?;
+        for memory in all_lt {
+            if regex.is_match(&memory.experience.content) {
+                self.retriever.remove_memory(&memory.id);
+                self.long_term_memory.delete(&memory.id)?;
+                long_term_removed += 1;
+                count += 1;
+            }
+        }
+
+        // Update stats
+        {
+            let mut stats = self.stats.write();
+            stats.total_memories = stats.total_memories.saturating_sub(count);
+            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
+            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
+            stats.long_term_memory_count = stats.long_term_memory_count.saturating_sub(long_term_removed);
+            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
+        }
 
         Ok(count)
     }
@@ -1201,6 +1264,9 @@ impl MemorySystem {
     /// Forget memories matching ANY of the specified tags
     fn forget_by_tags(&self, tags: &[String]) -> Result<usize> {
         let mut count = 0;
+        let mut working_removed = 0;
+        let mut session_removed = 0;
+        let mut long_term_removed = 0;
 
         // Remove from working memory
         {
@@ -1213,6 +1279,8 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    working_removed += 1;
                     count += 1;
                 }
             }
@@ -1229,6 +1297,8 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    session_removed += 1;
                     count += 1;
                 }
             }
@@ -1238,9 +1308,21 @@ impl MemorySystem {
         let all_lt = self.long_term_memory.get_all()?;
         for memory in all_lt {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
+                self.retriever.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
+                long_term_removed += 1;
                 count += 1;
             }
+        }
+
+        // Update stats
+        {
+            let mut stats = self.stats.write();
+            stats.total_memories = stats.total_memories.saturating_sub(count);
+            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
+            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
+            stats.long_term_memory_count = stats.long_term_memory_count.saturating_sub(long_term_removed);
+            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
         }
 
         Ok(count)
@@ -1253,6 +1335,9 @@ impl MemorySystem {
         end: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize> {
         let mut count = 0;
+        let mut working_removed = 0;
+        let mut session_removed = 0;
+        let mut long_term_removed = 0;
 
         // Remove from working memory
         {
@@ -1265,6 +1350,8 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    working_removed += 1;
                     count += 1;
                 }
             }
@@ -1281,6 +1368,8 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    session_removed += 1;
                     count += 1;
                 }
             }
@@ -1291,8 +1380,20 @@ impl MemorySystem {
             .long_term_memory
             .search(storage::SearchCriteria::ByDate { start, end })?;
         for memory in memories {
+            self.retriever.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
+            long_term_removed += 1;
             count += 1;
+        }
+
+        // Update stats
+        {
+            let mut stats = self.stats.write();
+            stats.total_memories = stats.total_memories.saturating_sub(count);
+            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
+            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
+            stats.long_term_memory_count = stats.long_term_memory_count.saturating_sub(long_term_removed);
+            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
         }
 
         Ok(count)
@@ -1301,6 +1402,9 @@ impl MemorySystem {
     /// Forget memories of a specific type
     fn forget_by_type(&self, exp_type: ExperienceType) -> Result<usize> {
         let mut count = 0;
+        let mut working_removed = 0;
+        let mut session_removed = 0;
+        let mut long_term_removed = 0;
 
         // Remove from working memory
         {
@@ -1313,6 +1417,8 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    working_removed += 1;
                     count += 1;
                 }
             }
@@ -1329,6 +1435,8 @@ impl MemorySystem {
                 .collect();
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
+                    self.retriever.remove_memory(id);
+                    session_removed += 1;
                     count += 1;
                 }
             }
@@ -1339,8 +1447,20 @@ impl MemorySystem {
             .long_term_memory
             .search(storage::SearchCriteria::ByType(exp_type))?;
         for memory in memories {
+            self.retriever.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
+            long_term_removed += 1;
             count += 1;
+        }
+
+        // Update stats
+        {
+            let mut stats = self.stats.write();
+            stats.total_memories = stats.total_memories.saturating_sub(count);
+            stats.working_memory_count = stats.working_memory_count.saturating_sub(working_removed);
+            stats.session_memory_count = stats.session_memory_count.saturating_sub(session_removed);
+            stats.long_term_memory_count = stats.long_term_memory_count.saturating_sub(long_term_removed);
+            stats.vector_index_count = stats.vector_index_count.saturating_sub(count);
         }
 
         Ok(count)
@@ -1353,30 +1473,54 @@ impl MemorySystem {
     fn forget_all(&self) -> Result<usize> {
         let mut count = 0;
 
-        // Clear working memory
+        // Collect all IDs from working memory and clear
+        let working_ids: Vec<MemoryId> = {
+            let working = self.working_memory.read();
+            working.all_memories().iter().map(|m| m.id.clone()).collect()
+        };
+        let working_count = working_ids.len();
+        for id in &working_ids {
+            self.retriever.remove_memory(id);
+        }
         {
             let mut working = self.working_memory.write();
-            count += working.len();
             working.clear();
         }
+        count += working_count;
 
-        // Clear session memory
+        // Collect all IDs from session memory and clear
+        let session_ids: Vec<MemoryId> = {
+            let session = self.session_memory.read();
+            session.all_memories().iter().map(|m| m.id.clone()).collect()
+        };
+        let session_count = session_ids.len();
+        for id in &session_ids {
+            self.retriever.remove_memory(id);
+        }
         {
             let mut session = self.session_memory.write();
-            count += session.len();
             session.clear();
         }
+        count += session_count;
 
         // Clear all from long-term memory (hard delete)
         let all_lt = self.long_term_memory.get_all()?;
+        let long_term_count = all_lt.len();
         for memory in all_lt {
+            self.retriever.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
-            count += 1;
         }
+        count += long_term_count;
 
-        // Note: Vector index is NOT cleared here - it will be rebuilt on next use
-        // when rebuild_vector_index() is called. This is acceptable for GDPR
-        // compliance since the source data (storage) is deleted.
+        // Reset all stats to zero
+        {
+            let mut stats = self.stats.write();
+            stats.total_memories = 0;
+            stats.working_memory_count = 0;
+            stats.session_memory_count = 0;
+            stats.long_term_memory_count = 0;
+            stats.vector_index_count = 0;
+        }
 
         Ok(count)
     }

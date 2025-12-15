@@ -1711,6 +1711,8 @@ pub enum RetrievalMode {
 /// Criteria for forgetting memories
 #[derive(Debug, Clone)]
 pub enum ForgetCriteria {
+    /// Delete a single memory by its ID
+    ById(MemoryId),
     OlderThan(u32),     // Days
     LowImportance(f32), // Threshold
     Pattern(String),    // Regex pattern

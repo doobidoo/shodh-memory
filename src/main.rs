@@ -4091,11 +4091,11 @@ async fn delete_memory(
 
     let memory_guard = memory.read();
 
-    // Delete by ID - escape UUID to treat as literal string, not regex
-    // UUIDs contain hyphens which are regex metacharacters, so we must escape them
-    let escaped_pattern = regex::escape(&memory_id);
+    // Parse UUID and delete by ID directly (not by pattern matching)
+    let uuid = uuid::Uuid::parse_str(&memory_id)
+        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
     memory_guard
-        .forget(memory::ForgetCriteria::Pattern(escaped_pattern))
+        .forget(memory::ForgetCriteria::ById(memory::MemoryId(uuid)))
         .map_err(AppError::Internal)?;
 
     // Enterprise audit logging

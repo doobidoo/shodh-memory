@@ -1222,14 +1222,14 @@ impl PyMemorySystem {
     ///
     /// Matches REST DELETE /api/memory/{id} endpoint.
     fn forget(&self, memory_id: &str) -> PyResult<bool> {
-        // Validate the memory ID is a valid UUID
-        uuid::Uuid::parse_str(memory_id)
+        // Validate and parse the memory ID as a valid UUID
+        let uuid = uuid::Uuid::parse_str(memory_id)
             .map_err(|e| PyValueError::new_err(format!("Invalid memory ID: {}", e)))?;
 
-        // Use Pattern with exact ID match to delete by ID content
+        // Use ById to delete the specific memory
         let deleted = self
             .inner
-            .forget(ForgetCriteria::Pattern(format!("^{}$", memory_id)))
+            .forget(ForgetCriteria::ById(MemoryId(uuid)))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete memory: {}", e)))?;
 
         Ok(deleted > 0)
