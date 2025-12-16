@@ -30,14 +30,39 @@ use crate::embeddings::{minilm::MiniLMEmbedder, Embedder};
 use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
 
 /// Multi-modal retrieval engine with production vector search
+///
+/// # Lock Ordering (SHO-72)
+///
+/// To prevent deadlocks, locks MUST be acquired in this order:
+///
+/// 1. `vector_index` - Vector similarity search index
+/// 2. `id_mapping` - Memory ID ↔ Vector ID mapping
+/// 3. `graph` - Memory association graph (Hebbian learning)
+/// 4. `consolidation_events` - Introspection event buffer
+///
+/// **Rules:**
+/// - Never acquire a higher-numbered lock while holding a lower-numbered lock
+/// - For read operations, prefer `read()` over `write()` when possible
+/// - Release locks as soon as possible (don't hold during I/O)
+/// - `graph_maintenance()` acquires only `graph` lock - safe to run concurrently with searches
+/// - `record_coactivation()` acquires only `graph` lock - no ordering conflict
+///
+/// **Why this ordering:**
+/// - Search operations need vector_index → id_mapping (common path)
+/// - Hebbian updates need id_mapping → graph (after search)
+/// - Introspection needs graph → consolidation_events (for reporting)
 pub struct RetrievalEngine {
     storage: Arc<MemoryStorage>,
     embedder: Arc<MiniLMEmbedder>,
+    /// Lock order: 1 - Acquire first
     vector_index: Arc<RwLock<VamanaIndex>>,
+    /// Lock order: 2
     id_mapping: Arc<RwLock<IdMapping>>,
-    graph: RwLock<MemoryGraph>, // Interior mutability for graph updates
+    /// Lock order: 3 - Interior mutability for graph updates
+    graph: RwLock<MemoryGraph>,
     /// Storage path for persisting vector index and ID mapping
     storage_path: PathBuf,
+    /// Lock order: 4 - Acquire last
     /// Shared consolidation event buffer for introspection
     /// Records edge formation, strengthening, and pruning events
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,

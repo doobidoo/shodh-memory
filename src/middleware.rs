@@ -140,29 +140,128 @@ fn normalize_path(path: &str) -> String {
     format!("/{}", normalized.join("/"))
 }
 
-/// Check if a path segment looks like an ID (UUID, numeric, user ID, etc.)
+/// Known path segments that should NEVER be treated as IDs (SHO-71)
+const KNOWN_PATH_SEGMENTS: &[&str] = &[
+    "v1",
+    "v2",
+    "v3",
+    "api",
+    "api2",
+    "health",
+    "metrics",
+    "status",
+    "docs",
+    "swagger",
+    "remember",
+    "recall",
+    "forget",
+    "stats",
+    "stream",
+    "events",
+    "settings",
+    "config",
+    "preferences",
+    "notifications",
+    "webhooks",
+    "auth",
+    "login",
+    "logout",
+    "register",
+    "oauth",
+    "token",
+    "refresh",
+    "list",
+    "create",
+    "update",
+    "delete",
+    "search",
+    "query",
+    "sync",
+    "linear",
+    "github",
+    "import",
+    "export",
+    "memories",
+    "context",
+    "session",
+    "working",
+    "longterm",
+    "consolidate",
+    "maintenance",
+    "repair",
+    "rebuild",
+    "graph",
+    "edges",
+    "entities",
+    "reinforce",
+    "coactivation",
+    "introspection",
+    "report",
+    "consolidation",
+    "learning",
+    "tags",
+    "date",
+    "proactive",
+    "verify",
+    "index",
+];
+
+/// Check if a path segment looks like an ID (UUID, numeric, user ID, etc.) (SHO-71)
+///
+/// Improved detection to avoid false positives on legitimate path segments.
 fn is_id(segment: &str) -> bool {
-    // UUID pattern
-    if segment.contains('-') && segment.len() >= 32 {
+    // Never treat known path segments as IDs
+    let lower = segment.to_lowercase();
+    if KNOWN_PATH_SEGMENTS.contains(&lower.as_str()) {
+        return false;
+    }
+
+    // UUID pattern: 8-4-4-4-12 hex chars with dashes (36 chars total)
+    if segment.len() == 36 && segment.matches('-').count() == 4 {
+        let parts: Vec<&str> = segment.split('-').collect();
+        if parts.len() == 5
+            && parts[0].len() == 8
+            && parts[1].len() == 4
+            && parts[2].len() == 4
+            && parts[3].len() == 4
+            && parts[4].len() == 12
+            && parts
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return true;
+        }
+    }
+
+    // Pure numeric ID (any length)
+    if !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
 
-    // Numeric ID
-    if segment.chars().all(|c| c.is_numeric()) && !segment.is_empty() {
+    // Hash-like strings: very long alphanumeric (>40 chars, like SHA256)
+    if segment.len() > 40 && segment.chars().all(|c| c.is_ascii_alphanumeric()) {
         return true;
     }
 
-    // Looks like a hash or long alphanumeric
-    if segment.len() > 20 {
-        return true;
+    // ID with common prefixes: user_123, mem_abc, id-456
+    let id_prefixes = [
+        "user_", "user-", "mem_", "mem-", "id_", "id-", "uid_", "uid-", "drone_", "drone-",
+        "robot_", "robot-", "session_", "session-", "mission_", "mission-",
+    ];
+    for prefix in id_prefixes {
+        if lower.starts_with(prefix) {
+            return true;
+        }
     }
 
-    // User ID pattern (alphanumeric with digits, like "user123" or "drone_001")
-    // Must contain at least one digit and be alphanumeric (with underscores)
-    let has_digit = segment.chars().any(|c| c.is_numeric());
-    let is_alphanumeric = segment.chars().all(|c| c.is_alphanumeric() || c == '_');
-    if has_digit && is_alphanumeric && segment.len() >= 4 {
-        return true;
+    // Short alphanumeric with majority digits (like "abc123", "x99")
+    if segment.len() >= 3 && segment.len() <= 20 {
+        let digit_count = segment.chars().filter(|c| c.is_ascii_digit()).count();
+        let alpha_count = segment.chars().filter(|c| c.is_alphabetic()).count();
+        // If >50% digits and has both letters and digits, it's likely an ID
+        if digit_count > 0 && alpha_count > 0 && digit_count >= segment.len() / 2 {
+            return true;
+        }
     }
 
     false
@@ -174,18 +273,45 @@ mod tests {
 
     #[test]
     fn test_normalize_path() {
+        // User IDs should be normalized
         assert_eq!(
             normalize_path("/api/users/user123/memories"),
             "/api/users/{id}/memories"
         );
+        // UUIDs should be normalized
         assert_eq!(
             normalize_path("/api/memories/550e8400-e29b-41d4-a716-446655440000"),
             "/api/memories/{id}"
         );
+        // Health check should NOT be normalized
         assert_eq!(normalize_path("/health"), "/health");
+        // Numeric IDs should be normalized
         assert_eq!(
             normalize_path("/api/users/12345/stats"),
             "/api/users/{id}/stats"
         );
+    }
+
+    #[test]
+    fn test_known_paths_not_normalized() {
+        // SHO-71: Known path segments should NOT be treated as IDs
+        assert_eq!(
+            normalize_path("/api/settings/notifications"),
+            "/api/settings/notifications"
+        );
+        assert_eq!(normalize_path("/api/recall/tags"), "/api/recall/tags");
+        assert_eq!(
+            normalize_path("/api/consolidation/report"),
+            "/api/consolidation/report"
+        );
+        assert_eq!(normalize_path("/api/v2/remember"), "/api/v2/remember");
+    }
+
+    #[test]
+    fn test_uuid_detection() {
+        // Valid UUID should be detected
+        assert!(is_id("550e8400-e29b-41d4-a716-446655440000"));
+        // Invalid UUID-like strings should not match
+        assert!(!is_id("not-a-valid-uuid-at-all"));
     }
 }

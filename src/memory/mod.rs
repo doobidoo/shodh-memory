@@ -28,6 +28,11 @@ use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::metrics::{
+    EMBEDDING_CACHE_CONTENT, EMBEDDING_CACHE_CONTENT_SIZE, EMBEDDING_CACHE_QUERY,
+    EMBEDDING_CACHE_QUERY_SIZE,
+};
+
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
     DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, ESTIMATED_BYTES_PER_MEMORY,
@@ -215,13 +220,16 @@ impl MemorySystem {
             // Check cache first
             if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
                 experience.embeddings = Some(cached_embedding.clone());
+                EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
                 tracing::debug!("Content embedding cache HIT");
             } else {
                 // Cache miss - generate embedding
+                EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
                 match self.embedder.encode(&experience.content) {
                     Ok(embedding) => {
                         // Store in cache for future use
                         self.content_cache.insert(content_hash, embedding.clone());
+                        EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.len() as i64);
                         experience.embeddings = Some(embedding);
                         tracing::debug!("Content embedding cache MISS - generated and cached");
                     }
@@ -395,6 +403,43 @@ impl MemorySystem {
         Ok(memories)
     }
 
+    /// Paginated memory retrieval with "has_more" indicator (SHO-69)
+    ///
+    /// Returns a PaginatedResults struct containing:
+    /// - The page of results
+    /// - Whether there are more results beyond this page
+    /// - The total count (if computed)
+    /// - Pagination metadata (offset, limit)
+    ///
+    /// Uses the limit+1 trick: requests one extra result to detect if there are more.
+    pub fn paginated_retrieve(&self, query: &Query) -> Result<PaginatedResults<SharedMemory>> {
+        // Request limit+1 to detect if there are more results
+        let extra_limit = query.max_results + 1;
+        let mut modified_query = query.clone();
+        modified_query.max_results = extra_limit;
+        modified_query.offset = 0; // We handle offset ourselves
+
+        // Get all results up to extra_limit
+        let all_results = self.retrieve(&modified_query)?;
+
+        // Apply offset and limit, detect has_more
+        let offset = query.offset;
+        let limit = query.max_results;
+
+        let results_after_offset: Vec<_> = all_results.into_iter().skip(offset).collect();
+        let has_more = results_after_offset.len() > limit;
+
+        let final_results: Vec<_> = results_after_offset.into_iter().take(limit).collect();
+
+        Ok(PaginatedResults {
+            results: final_results,
+            has_more,
+            total_count: None, // Computing total would require a separate count query
+            offset,
+            limit,
+        })
+    }
+
     /// CACHE-AWARE semantic retrieval: Check working → session → storage
     ///
     /// Implementation:
@@ -410,10 +455,12 @@ impl MemorySystem {
 
         // Check cache first
         let query_embedding = if let Some(cached_embedding) = self.query_cache.get(&query_hash) {
+            EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
             tracing::debug!("Query embedding cache HIT for: {}", query_text);
             cached_embedding.clone()
         } else {
             // Cache miss - generate embedding
+            EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
             tracing::debug!(
                 "Query embedding cache MISS - generating for: {}",
                 query_text
@@ -426,6 +473,7 @@ impl MemorySystem {
 
             // Store in cache for future use
             self.query_cache.insert(query_hash, embedding.clone());
+            EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.len() as i64);
             embedding
         };
 
@@ -453,6 +501,7 @@ impl MemorySystem {
             pattern_id: query.pattern_id.clone(),
             terrain_type: query.terrain_type.clone(),
             confidence_range: query.confidence_range,
+            offset: query.offset,
         };
 
         // Get memory IDs from vector search (fast HNSW search)

@@ -355,6 +355,42 @@ lazy_static! {
             .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0])
         ).expect("BATCH_STORE_SIZE metric must be valid at compile time")
     };
+
+    // ============================================================================
+    // Embedding Cache Metrics (SHO-68)
+    // ============================================================================
+
+    /// Embedding cache operations (query cache)
+    pub static ref EMBEDDING_CACHE_QUERY: IntCounterVec = {
+        IntCounterVec::new(
+            Opts::new("shodh_embedding_cache_query_total", "Query embedding cache operations"),
+            &["result"]  // result: "hit" or "miss"
+        ).expect("EMBEDDING_CACHE_QUERY metric must be valid at compile time")
+    };
+
+    /// Embedding cache operations (content cache)
+    pub static ref EMBEDDING_CACHE_CONTENT: IntCounterVec = {
+        IntCounterVec::new(
+            Opts::new("shodh_embedding_cache_content_total", "Content embedding cache operations"),
+            &["result"]  // result: "hit" or "miss"
+        ).expect("EMBEDDING_CACHE_CONTENT metric must be valid at compile time")
+    };
+
+    /// Current cache size (query cache)
+    pub static ref EMBEDDING_CACHE_QUERY_SIZE: IntGauge = {
+        IntGauge::new(
+            "shodh_embedding_cache_query_size",
+            "Current number of entries in query embedding cache"
+        ).expect("EMBEDDING_CACHE_QUERY_SIZE metric must be valid at compile time")
+    };
+
+    /// Current cache size (content cache)
+    pub static ref EMBEDDING_CACHE_CONTENT_SIZE: IntGauge = {
+        IntGauge::new(
+            "shodh_embedding_cache_content_size",
+            "Current number of entries in content embedding cache"
+        ).expect("EMBEDDING_CACHE_CONTENT_SIZE metric must be valid at compile time")
+    };
 }
 
 /// Register all metrics with the global registry
@@ -439,6 +475,12 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Batch operation metrics
     register!(BATCH_STORE_DURATION, "BATCH_STORE_DURATION");
     register!(BATCH_STORE_SIZE, "BATCH_STORE_SIZE");
+
+    // Embedding cache metrics (SHO-68)
+    register!(EMBEDDING_CACHE_QUERY, "EMBEDDING_CACHE_QUERY");
+    register!(EMBEDDING_CACHE_CONTENT, "EMBEDDING_CACHE_CONTENT");
+    register!(EMBEDDING_CACHE_QUERY_SIZE, "EMBEDDING_CACHE_QUERY_SIZE");
+    register!(EMBEDDING_CACHE_CONTENT_SIZE, "EMBEDDING_CACHE_CONTENT_SIZE");
 
     if errors.is_empty() {
         Ok(())

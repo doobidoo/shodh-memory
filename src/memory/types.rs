@@ -1438,6 +1438,60 @@ pub struct Query {
     // === Result Control ===
     pub max_results: usize,
     pub retrieval_mode: RetrievalMode,
+
+    // === Pagination (SHO-69) ===
+    /// Offset for pagination (skip first N results)
+    pub offset: usize,
+}
+
+/// Paginated search results with metadata for "load more" patterns (SHO-69)
+#[derive(Debug, Clone)]
+pub struct PaginatedResults<T> {
+    /// The results for this page
+    pub results: Vec<T>,
+    /// Whether there are more results beyond this page
+    pub has_more: bool,
+    /// Total count of matching results (if available, may be expensive to compute)
+    pub total_count: Option<usize>,
+    /// The offset used for this query
+    pub offset: usize,
+    /// The limit used for this query
+    pub limit: usize,
+}
+
+impl<T> PaginatedResults<T> {
+    /// Create a new paginated result from a full result set
+    pub fn from_results(all_results: Vec<T>, offset: usize, limit: usize) -> Self {
+        let total_count = all_results.len();
+        let end = (offset + limit).min(total_count);
+        let results: Vec<T> = all_results.into_iter().skip(offset).take(limit).collect();
+        let has_more = end < total_count;
+
+        Self {
+            results,
+            has_more,
+            total_count: Some(total_count),
+            offset,
+            limit,
+        }
+    }
+
+    /// Create a paginated result when total count is unknown
+    /// Uses limit+1 trick: request limit+1, return limit, has_more if got limit+1
+    pub fn from_limited_results(mut results: Vec<T>, limit: usize, offset: usize) -> Self {
+        let has_more = results.len() > limit;
+        if has_more {
+            results.pop(); // Remove the extra result we fetched
+        }
+
+        Self {
+            results,
+            has_more,
+            total_count: None,
+            offset,
+            limit,
+        }
+    }
 }
 
 impl Default for Query {
@@ -1463,6 +1517,7 @@ impl Default for Query {
             confidence_range: None,
             max_results: DEFAULT_MAX_RESULTS,
             retrieval_mode: RetrievalMode::Hybrid,
+            offset: 0,
         }
     }
 }
@@ -1691,6 +1746,12 @@ impl QueryBuilder {
 
     pub fn retrieval_mode(mut self, mode: RetrievalMode) -> Self {
         self.query.retrieval_mode = mode;
+        self
+    }
+
+    /// Set offset for pagination (skip first N results)
+    pub fn offset(mut self, offset: usize) -> Self {
+        self.query.offset = offset;
         self
     }
 
