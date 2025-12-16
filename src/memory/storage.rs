@@ -10,6 +10,28 @@ use std::sync::Arc;
 
 use super::types::*;
 
+/// Helper trait to safely iterate over RocksDB results with error logging.
+/// Unlike `.flatten()` which silently ignores errors, this logs them.
+trait LogErrors<T> {
+    fn log_errors(self) -> impl Iterator<Item = T>;
+}
+
+impl<I, T, E> LogErrors<T> for I
+where
+    I: Iterator<Item = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    fn log_errors(self) -> impl Iterator<Item = T> {
+        self.filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("RocksDB iterator error (continuing): {}", e);
+                None
+            }
+        })
+    }
+}
+
 /// Write mode for storage operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
@@ -276,7 +298,7 @@ impl MemoryStorage {
             rocksdb::Direction::Forward,
         ));
 
-        for (key, _value) in iter.flatten() {
+        for (key, _value) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
                 break;
@@ -502,7 +524,7 @@ impl MemoryStorage {
             start_key.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, _value) in iter.flatten() {
+        for (key, _value) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if key_str.as_ref() > end_key.as_str() {
                 break;
@@ -530,7 +552,7 @@ impl MemoryStorage {
             prefix.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, _) in iter.flatten() {
+        for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
                 break;
@@ -558,7 +580,7 @@ impl MemoryStorage {
                 rocksdb::Direction::Forward,
             ));
 
-            for (key, _) in iter.flatten() {
+            for (key, _) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
                 if !key_str.starts_with(&prefix) {
                     break;
@@ -585,7 +607,7 @@ impl MemoryStorage {
             prefix.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, _) in iter.flatten() {
+        for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
                 break;
@@ -616,7 +638,7 @@ impl MemoryStorage {
                 prefix.as_bytes(),
                 rocksdb::Direction::Forward,
             ));
-            for (key, _) in iter.flatten() {
+            for (key, _) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
                 if !key_str.starts_with(&prefix) {
                     break;
@@ -645,7 +667,7 @@ impl MemoryStorage {
             prefix.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, _) in iter.flatten() {
+        for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
                 break;
@@ -669,7 +691,7 @@ impl MemoryStorage {
             prefix.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, _) in iter.flatten() {
+        for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
                 break;
@@ -710,7 +732,7 @@ impl MemoryStorage {
                 rocksdb::Direction::Forward,
             ));
 
-            for (key, _value) in iter.flatten() {
+            for (key, _value) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
                 if !key_str.starts_with(&prefix) {
                     break;
@@ -747,7 +769,7 @@ impl MemoryStorage {
             prefix.as_bytes(),
             rocksdb::Direction::Forward,
         ));
-        for (key, _) in iter.flatten() {
+        for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
                 break;
@@ -780,7 +802,7 @@ impl MemoryStorage {
                 rocksdb::Direction::Forward,
             ));
 
-            for (key, _) in iter.flatten() {
+            for (key, _) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
                 if !key_str.starts_with(&prefix) {
                     break;
@@ -802,7 +824,7 @@ impl MemoryStorage {
 
         // Iterate through all memories
         let iter = self.db.iterator(IteratorMode::Start);
-        for (_, value) in iter.flatten() {
+        for (_, value) in iter.log_errors() {
             if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
                 memories.push(memory);
             }
@@ -816,7 +838,7 @@ impl MemoryStorage {
 
         // Iterate through all memories
         let iter = self.db.iterator(IteratorMode::Start);
-        for (_, value) in iter.flatten() {
+        for (_, value) in iter.log_errors() {
             if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
                 if !memory.compressed && memory.created_at < cutoff {
                     memories.push(memory);
@@ -836,7 +858,7 @@ impl MemoryStorage {
         write_opts.set_sync(true);
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.flatten() {
+        for (key, value) in iter.log_errors() {
             if let Ok(mut memory) = bincode::deserialize::<Memory>(&value) {
                 if memory.created_at < cutoff {
                     // Add forgotten flag to metadata
@@ -868,7 +890,7 @@ impl MemoryStorage {
         write_opts.set_sync(true);
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.flatten() {
+        for (key, value) in iter.log_errors() {
             if let Ok(mut memory) = bincode::deserialize::<Memory>(&value) {
                 if memory.importance() < threshold {
                     memory
@@ -896,7 +918,7 @@ impl MemoryStorage {
         let mut to_delete = Vec::new();
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.flatten() {
+        for (key, value) in iter.log_errors() {
             if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
                 if regex.is_match(&memory.experience.content) {
                     to_delete.push(key.to_vec());
