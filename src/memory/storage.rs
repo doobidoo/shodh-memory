@@ -225,7 +225,8 @@ impl MemoryStorage {
         // Index by reward (bucketed, for RL-style queries)
         // Bucket: -1.0 to 1.0 mapped to 0-20
         if let Some(reward) = memory.experience.reward {
-            let reward_bucket = ((reward + 1.0) * 10.0) as i32;
+            let clamped_reward = reward.clamp(-1.0, 1.0);
+            let reward_bucket = ((clamped_reward + 1.0) * 10.0) as i32;
             let reward_key = format!("reward:{}:{}", reward_bucket, memory.id.0);
             batch.put(reward_key.as_bytes(), b"1");
         }
@@ -766,8 +767,11 @@ impl MemoryStorage {
         let mut ids = Vec::new();
 
         // Reward is bucketed similar to importance (-10 to 10 buckets)
-        let min_bucket = ((min + 1.0) * 10.0) as i32; // -1.0 -> 0, 1.0 -> 20
-        let max_bucket = ((max + 1.0) * 10.0) as i32;
+        // Clamp to prevent bucket overflow from out-of-range values
+        let clamped_min = min.clamp(-1.0, 1.0);
+        let clamped_max = max.clamp(-1.0, 1.0);
+        let min_bucket = ((clamped_min + 1.0) * 10.0) as i32; // -1.0 -> 0, 1.0 -> 20
+        let max_bucket = ((clamped_max + 1.0) * 10.0) as i32;
 
         for bucket in min_bucket..=max_bucket {
             let prefix = format!("reward:{bucket}:");

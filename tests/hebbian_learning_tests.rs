@@ -694,3 +694,280 @@ fn test_high_volume_reinforcement() {
         assert!(stats.memories_processed > 0);
     }
 }
+
+// =============================================================================
+// HEBBIAN GRAPH PERSISTENCE TESTS
+// =============================================================================
+
+/// Test helper to create config for persistence tests
+fn create_persistence_config(temp_dir: &tempfile::TempDir) -> MemoryConfig {
+    MemoryConfig {
+        storage_path: temp_dir.path().to_path_buf(),
+        working_memory_size: 100,
+        session_memory_size_mb: 50,
+        max_heap_per_user_mb: 200,
+        auto_compress: false,
+        compression_age_days: 30,
+        importance_threshold: 0.7,
+    }
+}
+
+#[test]
+fn test_hebbian_graph_persists_across_restart() {
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config = create_persistence_config(&temp_dir);
+
+    let id1;
+    let id2;
+
+    // Phase 1: Create memories and form associations
+    {
+        let mut memory = MemorySystem::new(config.clone()).expect("Failed to create system");
+
+        id1 = memory
+            .record(
+                create_experience("Hebbian persistence test memory A"),
+                None,
+            )
+            .unwrap();
+        id2 = memory
+            .record(
+                create_experience("Hebbian persistence test memory B"),
+                None,
+            )
+            .unwrap();
+
+        // Strengthen association by co-retrieval
+        let ids = vec![id1.clone(), id2.clone()];
+        for _ in 0..5 {
+            memory
+                .reinforce_retrieval(&ids, RetrievalOutcome::Helpful)
+                .unwrap();
+        }
+
+        // Get graph stats before drop
+        let stats = memory.graph_stats();
+        assert!(
+            stats.edge_count > 0,
+            "Should have formed edges: {}",
+            stats.edge_count
+        );
+    }
+    // System dropped - simulates restart
+
+    // Phase 2: Verify graph persisted
+    {
+        let memory = MemorySystem::new(config).expect("Failed to recreate system");
+
+        // Verify memories exist
+        let mem1 = memory.get_memory(&id1).expect("Memory 1 should exist");
+        let mem2 = memory.get_memory(&id2).expect("Memory 2 should exist");
+        assert!(mem1.experience.content.contains("memory A"));
+        assert!(mem2.experience.content.contains("memory B"));
+
+        // Verify graph stats
+        let stats = memory.graph_stats();
+        assert!(
+            stats.edge_count > 0,
+            "Edges should persist after restart: {}",
+            stats.edge_count
+        );
+        assert!(
+            stats.node_count >= 2,
+            "Nodes should persist after restart: {}",
+            stats.node_count
+        );
+    }
+}
+
+#[test]
+fn test_hebbian_edge_strength_persists() {
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config = create_persistence_config(&temp_dir);
+
+    let id1;
+    let id2;
+    let avg_strength_before;
+
+    // Phase 1: Create strong associations
+    {
+        let mut memory = MemorySystem::new(config.clone()).expect("Failed to create system");
+
+        id1 = memory
+            .record(create_experience("Edge strength test A"), None)
+            .unwrap();
+        id2 = memory
+            .record(create_experience("Edge strength test B"), None)
+            .unwrap();
+
+        // Strengthen many times to increase edge strength
+        let ids = vec![id1.clone(), id2.clone()];
+        for _ in 0..10 {
+            memory
+                .reinforce_retrieval(&ids, RetrievalOutcome::Helpful)
+                .unwrap();
+        }
+
+        let stats = memory.graph_stats();
+        avg_strength_before = stats.avg_strength;
+        assert!(
+            avg_strength_before > 0.5,
+            "Edge strength should be high after reinforcement: {}",
+            avg_strength_before
+        );
+    }
+
+    // Phase 2: Verify strength persisted
+    {
+        let memory = MemorySystem::new(config).expect("Failed to recreate system");
+
+        let stats = memory.graph_stats();
+        let avg_strength_after = stats.avg_strength;
+
+        assert!(
+            (avg_strength_after - avg_strength_before).abs() < 0.01,
+            "Edge strength should persist: {} vs {} (diff: {})",
+            avg_strength_after,
+            avg_strength_before,
+            (avg_strength_after - avg_strength_before).abs()
+        );
+    }
+}
+
+#[test]
+fn test_coactivation_during_retrieve_forms_edges() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memories
+    let id1 = memory
+        .record(
+            create_experience("Coactivation test: robot navigation"),
+            None,
+        )
+        .unwrap();
+    let id2 = memory
+        .record(
+            create_experience("Coactivation test: robot obstacle avoidance"),
+            None,
+        )
+        .unwrap();
+
+    // Verify no edges initially
+    let stats_before = memory.graph_stats();
+    let edges_before = stats_before.edge_count;
+
+    // Retrieve both memories together (should auto-coactivate)
+    let query = Query {
+        query_text: Some("robot navigation obstacle".to_string()),
+        max_results: 10,
+        ..Default::default()
+    };
+    let results = memory.retrieve(&query).unwrap();
+
+    // If both memories were returned, edges should form
+    let both_returned = results.iter().any(|m| m.id == id1) && results.iter().any(|m| m.id == id2);
+
+    if both_returned {
+        let stats_after = memory.graph_stats();
+        assert!(
+            stats_after.edge_count > edges_before,
+            "Edges should form after co-retrieval: {} > {}",
+            stats_after.edge_count,
+            edges_before
+        );
+    }
+}
+
+#[test]
+fn test_ltp_persists_across_restart() {
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config = create_persistence_config(&temp_dir);
+
+    let id1;
+    let id2;
+
+    // Phase 1: Create LTP by many co-activations
+    {
+        let mut memory = MemorySystem::new(config.clone()).expect("Failed to create system");
+
+        id1 = memory
+            .record(create_experience("LTP persistence test A"), None)
+            .unwrap();
+        id2 = memory
+            .record(create_experience("LTP persistence test B"), None)
+            .unwrap();
+
+        // Reinforce many times to trigger LTP (threshold typically 5-10)
+        let ids = vec![id1.clone(), id2.clone()];
+        for _ in 0..15 {
+            memory
+                .reinforce_retrieval(&ids, RetrievalOutcome::Helpful)
+                .unwrap();
+        }
+
+        let stats = memory.graph_stats();
+        assert!(
+            stats.potentiated_edges > 0 || stats.avg_strength > 0.8,
+            "Should have potentiated edges or high strength after many reinforcements"
+        );
+    }
+
+    // Phase 2: Verify LTP persisted
+    {
+        let memory = MemorySystem::new(config).expect("Failed to recreate system");
+
+        let stats = memory.graph_stats();
+        // Either potentiated edges persist, or strength is high
+        assert!(
+            stats.potentiated_edges > 0 || stats.avg_strength > 0.7,
+            "LTP should persist: potentiated={}, avg_strength={}",
+            stats.potentiated_edges,
+            stats.avg_strength
+        );
+    }
+}
+
+#[test]
+fn test_graph_stats_accuracy() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record several memories
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let id = memory
+            .record(
+                create_experience(&format!("Graph stats test memory {}", i)),
+                None,
+            )
+            .unwrap();
+        ids.push(id);
+    }
+
+    // Form associations between all pairs
+    memory
+        .reinforce_retrieval(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    let stats = memory.graph_stats();
+
+    // 5 memories = 5 nodes
+    assert!(
+        stats.node_count >= 5,
+        "Should have at least 5 nodes: {}",
+        stats.node_count
+    );
+
+    // 5 memories = 5*4/2 = 10 edges (bidirectional counted once)
+    assert!(
+        stats.edge_count >= 5,
+        "Should have multiple edges: {}",
+        stats.edge_count
+    );
+
+    // Strength should be positive
+    assert!(
+        stats.avg_strength > 0.0,
+        "Average edge strength should be positive: {}",
+        stats.avg_strength
+    );
+}

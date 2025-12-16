@@ -394,6 +394,12 @@ pub struct BufferedMessage {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// Maximum concurrent sessions per instance (prevents memory exhaustion)
+const MAX_CONCURRENT_SESSIONS: usize = 1000;
+
+/// Session timeout in seconds (1 hour of inactivity)
+const SESSION_TIMEOUT_SECS: i64 = 3600;
+
 /// Per-session streaming state
 pub struct StreamSession {
     /// Session identifier
@@ -417,6 +423,9 @@ pub struct StreamSession {
     /// Last extraction timestamp
     last_extraction: DateTime<Utc>,
 
+    /// Last activity timestamp (for stale session cleanup)
+    last_activity: DateTime<Utc>,
+
     /// Total memories created this session
     total_memories_created: usize,
 
@@ -435,6 +444,7 @@ impl StreamSession {
             .session_id
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        let now = Utc::now();
         Self {
             session_id,
             user_id: handshake.user_id,
@@ -442,7 +452,8 @@ impl StreamSession {
             config: handshake.extraction_config,
             metadata: handshake.metadata,
             buffer: VecDeque::with_capacity(64),
-            last_extraction: Utc::now(),
+            last_extraction: now,
+            last_activity: now,
             total_memories_created: 0,
             seen_hashes: HashSet::with_capacity(1024),
             recent_embeddings: VecDeque::with_capacity(100),
