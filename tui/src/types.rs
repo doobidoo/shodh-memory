@@ -187,7 +187,7 @@ impl GraphData {
                 }
             }
 
-            // Attractive forces along edges
+            // Attractive forces along edges (stronger attraction to cluster connected nodes)
             for edge in &self.edges {
                 let i_opt = self.nodes.iter().position(|n| n.id == edge.from_id);
                 let j_opt = self.nodes.iter().position(|n| n.id == edge.to_id);
@@ -197,8 +197,8 @@ impl GraphData {
                     let dy = self.nodes[i].y - self.nodes[j].y;
                     let dist = (dx * dx + dy * dy).sqrt().max(0.001);
 
-                    // Attractive force: d^2 / k, scaled by edge weight
-                    let attraction = (dist * dist) / k * edge.weight;
+                    // Stronger attractive force: d^2 / k * 3, scaled by edge weight
+                    let attraction = (dist * dist) / k * edge.weight * 3.0;
                     let fx = (dx / dist) * attraction;
                     let fy = (dy / dist) * attraction;
 
@@ -613,9 +613,9 @@ impl AppState {
             id.clone()
         };
         let n = self.graph_data.nodes.len() as f32;
-        let x = (n * 0.618).sin() * 0.35;
-        let y = (n * 0.618).cos() * 0.35;
-        let z = ((n * 0.3).sin() * 0.2).clamp(-0.3, 0.3);
+        let x = (n * 0.618).sin() * 0.35 + 0.5;
+        let y = (n * 0.618).cos() * 0.35 + 0.5;
+        let z = ((n * 0.3).sin() * 0.2 + 0.5).clamp(0.1, 0.9);
         self.graph_data.nodes.push(GraphNode {
             id,
             short_id,

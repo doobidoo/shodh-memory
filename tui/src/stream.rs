@@ -171,9 +171,9 @@ impl MemoryStream {
                 };
                 let n = state.graph_data.nodes.len() as f32;
                 let (x, y, z) = (
-                    (n * 0.618).sin() * 0.35,
-                    (n * 0.618).cos() * 0.35,
-                    ((n * 0.3).sin() * 0.2).clamp(-0.3, 0.3),
+                    (n * 0.618).sin() * 0.35 + 0.5,
+                    (n * 0.618).cos() * 0.35 + 0.5,
+                    ((n * 0.3).sin() * 0.2 + 0.5).clamp(0.1, 0.9),
                 );
                 // Store full content - truncation happens at display time
                 let content_preview = mem.content.clone();
@@ -240,17 +240,17 @@ impl MemoryStream {
                 } else {
                     star.id.clone()
                 };
-                // Normalize 3D position to -0.5 to 0.5 range for isometric projection
-                let x = (star.position.x / 100.0).clamp(-0.5, 0.5);
-                let y = (star.position.y / 100.0).clamp(-0.5, 0.5);
-                let z = (star.position.z / 100.0).clamp(-0.5, 0.5);
-                // Use golden angle for better distribution if position is zero
-                let (px, py, pz) = if x.abs() < 0.01 && y.abs() < 0.01 {
+                // Normalize 3D position to 0.1-0.9 range for force layout
+                let x = (star.position.x / 200.0 + 0.5).clamp(0.1, 0.9);
+                let y = (star.position.y / 200.0 + 0.5).clamp(0.1, 0.9);
+                let z = (star.position.z / 200.0 + 0.5).clamp(0.1, 0.9);
+                // Use golden angle for better distribution if position is near center
+                let (px, py, pz) = if (x - 0.5).abs() < 0.05 && (y - 0.5).abs() < 0.05 {
                     let n = i as f32;
                     (
-                        (n * 0.618).sin() * 0.35,
-                        (n * 0.618).cos() * 0.35,
-                        ((n * 0.3).sin() * 0.2).clamp(-0.3, 0.3),
+                        (n * 0.618).sin() * 0.35 + 0.5,
+                        (n * 0.618).cos() * 0.35 + 0.5,
+                        ((n * 0.3).sin() * 0.2 + 0.5).clamp(0.1, 0.9),
                     )
                 } else {
                     (x, y, z)
