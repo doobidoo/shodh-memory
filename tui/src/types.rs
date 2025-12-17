@@ -76,6 +76,30 @@ pub struct GraphNode {
     pub connections: u32,
     pub x: f32,
     pub y: f32,
+    pub z: f32,
+}
+
+impl GraphNode {
+    /// Project 3D coordinates to 2D using isometric projection with rotation
+    pub fn project_2d(&self, rotation: f32) -> (f32, f32, f32) {
+        let cos_r = rotation.cos();
+        let sin_r = rotation.sin();
+
+        // Rotate around Y axis
+        let rx = self.x * cos_r - self.z * sin_r;
+        let rz = self.x * sin_r + self.z * cos_r;
+
+        // Isometric projection
+        let screen_x = rx * 0.866 + 0.5; // cos(30°) ≈ 0.866
+        let screen_y = self.y * 0.5 + rz * 0.5 + 0.5;
+        let depth = rz; // for depth sorting and brightness
+
+        (
+            screen_x.clamp(0.05, 0.95),
+            screen_y.clamp(0.05, 0.95),
+            depth,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +211,9 @@ impl GraphData {
 
             // Apply displacements with temperature limiting
             for (i, node) in self.nodes.iter_mut().enumerate() {
-                let disp_len = (dx_vec[i] * dx_vec[i] + dy_vec[i] * dy_vec[i]).sqrt().max(0.001);
+                let disp_len = (dx_vec[i] * dx_vec[i] + dy_vec[i] * dy_vec[i])
+                    .sqrt()
+                    .max(0.001);
                 let scale = temp.min(disp_len) / disp_len;
 
                 node.x = (node.x + dx_vec[i] * scale).clamp(0.05, 0.95);
@@ -392,6 +418,8 @@ pub struct AppState {
     pub selected_event: Option<usize>,
     /// Error message to display in footer (message, timestamp)
     pub error_message: Option<(String, Instant)>,
+    /// Graph rotation angle in radians (for 3D view)
+    pub graph_rotation: f32,
 }
 
 impl AppState {
@@ -419,7 +447,16 @@ impl AppState {
             current_user: String::new(),
             selected_event: None,
             error_message: None,
+            graph_rotation: 0.0,
         }
+    }
+
+    pub fn rotate_graph_left(&mut self) {
+        self.graph_rotation -= 0.15;
+    }
+
+    pub fn rotate_graph_right(&mut self) {
+        self.graph_rotation += 0.15;
     }
 
     pub fn select_event_prev(&mut self) {
@@ -576,8 +613,9 @@ impl AppState {
             id.clone()
         };
         let n = self.graph_data.nodes.len() as f32;
-        let x = (n * 0.618).sin() * 0.35 + 0.5;
-        let y = (n * 0.618).cos() * 0.35 + 0.5;
+        let x = (n * 0.618).sin() * 0.35;
+        let y = (n * 0.618).cos() * 0.35;
+        let z = ((n * 0.3).sin() * 0.2).clamp(-0.3, 0.3);
         self.graph_data.nodes.push(GraphNode {
             id,
             short_id,
@@ -590,6 +628,7 @@ impl AppState {
             connections: 0,
             x,
             y,
+            z,
         });
     }
 

@@ -53,12 +53,14 @@ struct UniverseStar {
     position: UniversePosition,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 struct UniversePosition {
     #[serde(default)]
     x: f32,
     #[serde(default)]
     y: f32,
+    #[serde(default)]
+    z: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,9 +170,10 @@ impl MemoryStream {
                     mem.id.clone()
                 };
                 let n = state.graph_data.nodes.len() as f32;
-                let (x, y) = (
-                    (n * 0.618).sin() * 0.35 + 0.5,
-                    (n * 0.618).cos() * 0.35 + 0.5,
+                let (x, y, z) = (
+                    (n * 0.618).sin() * 0.35,
+                    (n * 0.618).cos() * 0.35,
+                    ((n * 0.3).sin() * 0.2).clamp(-0.3, 0.3),
                 );
                 // Store full content - truncation happens at display time
                 let content_preview = mem.content.clone();
@@ -208,6 +211,7 @@ impl MemoryStream {
                     connections: 0,
                     x,
                     y,
+                    z,
                 });
             }
             state.graph_stats.nodes = state.graph_data.nodes.len() as u32;
@@ -236,18 +240,20 @@ impl MemoryStream {
                 } else {
                     star.id.clone()
                 };
-                // Normalize position to 0-1 range
-                let x = (star.position.x / 100.0).clamp(0.1, 0.9);
-                let y = (star.position.y / 100.0).clamp(0.1, 0.9);
+                // Normalize 3D position to -0.5 to 0.5 range for isometric projection
+                let x = (star.position.x / 100.0).clamp(-0.5, 0.5);
+                let y = (star.position.y / 100.0).clamp(-0.5, 0.5);
+                let z = (star.position.z / 100.0).clamp(-0.5, 0.5);
                 // Use golden angle for better distribution if position is zero
-                let (px, py) = if x.abs() < 0.01 && y.abs() < 0.01 {
+                let (px, py, pz) = if x.abs() < 0.01 && y.abs() < 0.01 {
                     let n = i as f32;
                     (
-                        (n * 0.618).sin() * 0.35 + 0.5,
-                        (n * 0.618).cos() * 0.35 + 0.5,
+                        (n * 0.618).sin() * 0.35,
+                        (n * 0.618).cos() * 0.35,
+                        ((n * 0.3).sin() * 0.2).clamp(-0.3, 0.3),
                     )
                 } else {
-                    (x.abs().min(0.9).max(0.1), y.abs().min(0.9).max(0.1))
+                    (x, y, z)
                 };
                 state.graph_data.nodes.push(GraphNode {
                     id: star.id.clone(),
@@ -257,6 +263,7 @@ impl MemoryStream {
                     connections: star.mention_count as u32,
                     x: px,
                     y: py,
+                    z: pz,
                 });
             }
             state.graph_stats.nodes = state.graph_data.nodes.len() as u32;
