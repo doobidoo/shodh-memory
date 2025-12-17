@@ -200,7 +200,7 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(" Activity ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
-        .title(block::Title::from(Span::styled(" [a] river ", Style::default().fg(Color::DarkGray))).alignment(Alignment::Right));
+        .title(block::Title::from(Span::styled(" [a] logs ", Style::default().fg(Color::DarkGray))).alignment(Alignment::Right));
     let inner = block.inner(area);
     f.render_widget(block, area);
     
