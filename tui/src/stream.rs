@@ -130,7 +130,10 @@ impl MemoryStream {
         }
         if let Ok(list) = self.fetch_memory_list(user_id).await {
             let mut state = self.state.lock().await;
-            for mem in list.memories {
+            // Reverse so newest ends up at front (position 0) after push_front
+            let mut memories = list.memories;
+            memories.reverse();
+            for mem in memories {
                 state.type_stats.increment(&mem.memory_type);
                 for tag in &mem.tags {
                     state.entity_stats.total += 1;
