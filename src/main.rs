@@ -232,9 +232,11 @@ impl MultiUserMemoryManager {
         // Older events are dropped if subscribers can't keep up
         let (event_broadcaster, _) = tokio::sync::broadcast::channel(1024);
 
-        // Initialize Neural NER - auto-detects downloaded models
+        // Initialize Neural NER - check if models exist, download if not
+        let ner_dir = get_ner_models_dir();
+        tracing::debug!("Checking for NER models at {:?}", ner_dir);
         let neural_ner = if are_ner_models_downloaded() {
-            let ner_dir = get_ner_models_dir();
+            tracing::debug!("NER models found, using existing files");
             let config = NerConfig {
                 model_path: ner_dir.join("model.onnx"),
                 tokenizer_path: ner_dir.join("tokenizer.json"),
@@ -256,6 +258,7 @@ impl MultiUserMemoryManager {
             }
         } else {
             // Auto-download NER models if not present
+            tracing::debug!("NER models not found at {:?}, will download", ner_dir);
             info!("📥 Downloading NER models (TinyBERT-NER, ~15MB)...");
             match download_ner_models(Some(std::sync::Arc::new(|downloaded, total| {
                 if total > 0 {
