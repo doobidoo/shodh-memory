@@ -31,6 +31,26 @@ We built this because AI agents forget everything between sessions. They make th
 
 Shodh-Memory fixes that. It's a cognitive memory system—Hebbian learning, activation decay, semantic consolidation—packed into a single ~15MB binary that runs offline. Deploy on cloud, edge devices, or air-gapped systems.
 
+### TUI Dashboard
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/splash.jpg" width="700" alt="Shodh Splash">
+</p>
+
+<p align="center"><i>Cognitive Memory for AI Agents — Made in India</i></p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/dashboard.jpg" width="700" alt="Shodh Dashboard">
+</p>
+
+<p align="center"><i>Real-time activity feed, memory tiers, and detailed inspection</i></p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/graph-map.jpg" width="700" alt="Shodh Graph Map">
+</p>
+
+<p align="center"><i>Knowledge graph visualization — entity connections across memories</i></p>
+
 **How it works:**
 
 Experiences flow through three tiers based on Cowan's working memory model [1]. New information enters capacity-limited working memory, overflows into session storage, and consolidates into long-term memory based on importance. When memories are retrieved together successfully, their connections strengthen—classic Hebbian learning [2]. After enough co-activations, those connections become permanent. Unused memories naturally fade.
