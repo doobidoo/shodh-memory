@@ -29,7 +29,7 @@
 
 We built this because AI agents forget everything between sessions. They make the same mistakes, ask the same questions, lose context constantly.
 
-Shodh-Memory fixes that. It's a cognitive memory system—Hebbian learning, activation decay, semantic consolidation—packed into a single ~15MB binary that runs offline. Deploy on cloud, edge devices, or air-gapped systems.
+Shodh-Memory fixes that. It's a cognitive memory system—Hebbian learning, activation decay, semantic consolidation—packed into a single ~17MB binary that runs offline. Deploy on cloud, edge devices, or air-gapped systems.
 
 ### TUI Dashboard
 
@@ -76,6 +76,9 @@ Working Memory ──overflow──▶ Session Memory ──importance──▶ 
 - *Activation decay* — exponential decay A(t) = A₀ · e^(-λt) applied each maintenance cycle
 - *Hebbian strengthening* — co-retrieved memories form graph edges; weight increases on co-activation
 - *Long-term potentiation* — edges surviving threshold co-activations become permanent
+- *Memory replay* — important memories are replayed during maintenance to prevent decay (like sleep consolidation)
+- *Interference detection* — new memories can weaken conflicting old ones via retroactive interference
+- *Proactive context* — automatically surfaces relevant memories based on current conversation
 
 **Semantic Consolidation**
 
@@ -96,7 +99,7 @@ Working Memory ──overflow──▶ Session Memory ──importance──▶ 
 
 | | Shodh-Memory | Mem0 | Cognee |
 |---|---|---|---|
-| **Deployment** | Single 8MB binary | Cloud API | Neo4j + Vector DB |
+| **Deployment** | Single 17MB binary | Cloud API | Neo4j + Vector DB |
 | **Offline** | 100% | No | Partial |
 | **Learning** | Hebbian + decay + LTP | Vector similarity | Knowledge graphs |
 | **Latency** | Sub-millisecond | Network-bound | Database-bound |
@@ -232,11 +235,11 @@ curl -X POST http://localhost:3030/api/recall \
 Different types get different importance weights in the scoring model:
 
 - **Decision** (+0.30) — choices, preferences, conclusions
-- **Learning** (+0.25) — new knowledge, facts learned
-- **Error** (+0.25) — mistakes, things to avoid
+- **Learning**, **Error** (+0.25) — new knowledge, mistakes to avoid
 - **Discovery**, **Pattern** (+0.20) — findings, recurring behaviors
 - **Task** (+0.15) — work items
-- **Context**, **Observation** (+0.10) — general info
+- **Context**, **Conversation** (+0.10) — general info, chat history
+- **Observation** (+0.05) — low-priority notes
 
 
 ### API reference
@@ -262,6 +265,7 @@ Different types get different importance weights in the scoring model:
 | **Context & Introspection** ||
 | `context_summary(max_items, ...)` | Categorized context for LLM bootstrap |
 | `brain_state(longterm_limit)` | 3-tier memory visualization |
+| `consolidation_report(since, until)` | Memory learning activity report |
 | `flush()` | Flush data to disk |
 
 **REST endpoints**
@@ -277,6 +281,8 @@ All protected endpoints require `X-API-Key` header.
 | `/api/recall/date` | POST | Date-range search | 5ms |
 | `/api/list/{user_id}` | GET | List all memories | 1ms |
 | `/api/context_summary` | POST | Categorized context for session bootstrap | 15ms |
+| `/api/relevant` | POST | Proactive context surfacing | 50ms |
+| `/api/stream` | WS | Streaming memory ingestion | realtime |
 | **Forget Operations** ||||
 | `/api/forget/age` | POST | Delete memories older than threshold | 5ms |
 | `/api/forget/importance` | POST | Delete low-importance memories | 5ms |
@@ -295,6 +301,7 @@ All protected endpoints require `X-API-Key` header.
 | `/api/graph/{id}/stats` | GET | Knowledge graph statistics | 10ms |
 | `/api/brain/{user_id}` | GET | 3-tier state visualization | 50ms |
 | `/api/search/advanced` | POST | Multi-filter search | 50ms |
+| `/api/consolidation/report` | POST | Memory learning report (decay, strengthening) | 10ms |
 | **Health & Metrics** ||||
 | `/health` | GET | Health check (no auth) | <1ms |
 | `/health/live` | GET | Kubernetes liveness (no auth) | <1ms |
