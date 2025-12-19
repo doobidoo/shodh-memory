@@ -8,7 +8,7 @@ version = "0.1.5"
 description = "Local-first AI memory system for robotics, drones, and edge AI - 100% offline capable"
 authors = [{name = "Shodh Team", email = "29.varuns@gmail.com"}]
 license = {text = "Apache-2.0"}
-readme = "README.md"
+readme = "README-python.md"
 requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -43,3 +43,14 @@ features = ["python"]
 python-source = "python"
 module-name = "shodh_memory.shodh_memory"
 strip = true
+include = [
+    # ONNX Runtime (Windows)
+    { path = "shodh_memory/lib/onnxruntime.dll", format = "wheel" },
+    { path = "shodh_memory/lib/onnxruntime_providers_shared.dll", format = "wheel" },
+    # MiniLM embedding model (~22MB)
+    { path = "shodh_memory/models/minilm-l6/model_quantized.onnx", format = "wheel" },
+    { path = "shodh_memory/models/minilm-l6/tokenizer.json", format = "wheel" },
+    # TinyBERT NER model (~15MB)
+    { path = "shodh_memory/models/bert-tiny-ner/model.onnx", format = "wheel" },
+    { path = "shodh_memory/models/bert-tiny-ner/tokenizer.json", format = "wheel" },
+]

@@ -1,8 +1,6 @@
 name: crates.io Release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       publish:
@@ -17,7 +15,7 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.event.inputs.publish == 'true'
+    if: github.event.inputs.publish == 'true'
 
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Verify package (dry-run)
+        run: cargo publish --dry-run
 
       - name: Publish to crates.io
         run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

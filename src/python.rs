@@ -777,6 +777,7 @@ impl PyMemorySystem {
             confidence_range,
             max_results: limit,
             retrieval_mode,
+            offset: 0,
         };
 
         let memories = self

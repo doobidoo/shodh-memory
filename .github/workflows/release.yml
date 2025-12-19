@@ -20,10 +20,10 @@ jobs:
             os: ubuntu-latest
             name: shodh-memory-linux-x64
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-13  # Intel Mac runner for native x64 build
             name: shodh-memory-macos-x64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-latest  # ARM Mac runner (M1/M2)
             name: shodh-memory-macos-arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest

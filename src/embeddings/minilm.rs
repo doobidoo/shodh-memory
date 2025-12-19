@@ -49,9 +49,9 @@ impl LazyModel {
         );
 
         let session = Session::builder()
-            .context("Failed to create ONNX session builder")?
+            .context("Failed to create session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set intra threads")?
+            .context("Failed to set thread count")?
             .commit_from_file(&config.model_path)
             .context("Failed to load ONNX model")?;
 
@@ -97,26 +97,31 @@ impl EmbeddingConfig {
     ///
     /// Search order for model files:
     /// 1. SHODH_MODEL_PATH environment variable
-    /// 2. ./models/minilm-l6 (local)
-    /// 3. ../models/minilm-l6 (parent)
-    /// 4. ~/.cache/shodh-memory/models/minilm-l6 (auto-download location)
+    /// 2. Bundled in Python package (SHODH_PACKAGE_DIR/models/minilm-l6)
+    /// 3. ./models/minilm-l6 (local)
+    /// 4. ../models/minilm-l6 (parent)
+    /// 5. ~/.cache/shodh-memory/models/minilm-l6 (auto-download location)
     pub fn from_env() -> Self {
         let base_path = std::env::var("SHODH_MODEL_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                // Try common locations in order
-                let candidates = [
-                    PathBuf::from("./models/minilm-l6"),
-                    PathBuf::from("../models/minilm-l6"),
+                // Try common locations in order (bundled first for 1-click install)
+                let candidates = vec![
+                    // Bundled in Python package (highest priority for pip install)
+                    std::env::var("SHODH_PACKAGE_DIR")
+                        .ok()
+                        .map(|p| PathBuf::from(p).join("models/minilm-l6")),
+                    Some(PathBuf::from("./models/minilm-l6")),
+                    Some(PathBuf::from("../models/minilm-l6")),
                     // Auto-download cache location
-                    super::downloader::get_models_dir(),
+                    Some(super::downloader::get_models_dir()),
                     dirs::data_dir()
-                        .map(|p| p.join("shodh-memory/models/minilm-l6"))
-                        .unwrap_or_default(),
+                        .map(|p| p.join("shodh-memory/models/minilm-l6")),
                 ];
 
                 candidates
                     .into_iter()
+                    .flatten()
                     .find(|p| {
                         p.join("model_quantized.onnx").exists() || p.join("model.onnx").exists()
                     })
@@ -206,6 +211,17 @@ impl MiniLMEmbedder {
             }
         }
 
+        // Check for bundled ONNX Runtime in Python package (1-click install)
+        if let Some(bundled_path) = Self::find_bundled_onnx_runtime() {
+            tracing::info!(
+                "Using bundled ONNX Runtime from package: {:?}",
+                bundled_path
+            );
+            // SAFETY: This is called once via OnceLock, before other threads start
+            std::env::set_var("ORT_DYLIB_PATH", &bundled_path);
+            return Ok(bundled_path);
+        }
+
         // Check if we have ONNX Runtime in our cache
         if let Some(cached_path) = super::downloader::get_onnx_runtime_path() {
             tracing::info!(
@@ -232,6 +248,51 @@ impl MiniLMEmbedder {
         // SAFETY: This is called once via OnceLock, before other threads start
         std::env::set_var("ORT_DYLIB_PATH", &onnx_path);
         Ok(onnx_path)
+    }
+
+    /// Find bundled ONNX Runtime in the Python package's lib/ directory
+    fn find_bundled_onnx_runtime() -> Option<PathBuf> {
+        // Try to find ONNX Runtime bundled with the Python package
+        // The lib/ folder is adjacent to the shodh_memory.pyd file
+
+        #[cfg(target_os = "windows")]
+        let dll_name = "onnxruntime.dll";
+        #[cfg(target_os = "macos")]
+        let dll_name = "libonnxruntime.dylib";
+        #[cfg(target_os = "linux")]
+        let dll_name = "libonnxruntime.so";
+
+        // Common locations to check for bundled library
+        let candidates = [
+            // Relative to current executable (for standalone binary)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("lib").join(dll_name))),
+            // Relative to working directory
+            Some(PathBuf::from("lib").join(dll_name)),
+            // Python site-packages layout: shodh_memory/lib/onnxruntime.dll
+            dirs::data_dir().map(|p| {
+                p.join("Python")
+                    .join("site-packages")
+                    .join("shodh_memory")
+                    .join("lib")
+                    .join(dll_name)
+            }),
+            // Check relative to this module (for pip-installed packages)
+            // This uses the fact that Python modules are in site-packages/shodh_memory/
+            std::env::var("SHODH_PACKAGE_DIR")
+                .ok()
+                .map(|p| PathBuf::from(p).join("lib").join(dll_name)),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            if candidate.exists() {
+                tracing::debug!("Found bundled ONNX Runtime at: {:?}", candidate);
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 
     /// Create new MiniLM embedder with lazy loading (default)

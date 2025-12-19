@@ -11,10 +11,12 @@
   "scripts": {
     "start": "bun run index.ts",
     "build": "bun build index.ts --outdir dist --target node",
+    "postinstall": "node scripts/postinstall.js",
     "prepublishOnly": "npm run build"
   },
   "files": [
     "dist",
+    "scripts",
     "README.md"
   ],
   "dependencies": {

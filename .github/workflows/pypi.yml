@@ -1,8 +1,6 @@
 name: PyPI Release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       publish:
@@ -39,9 +37,9 @@ jobs:
           name: wheels-linux
           path: dist/*.whl
 
-  build-macos-wheels:
-    name: Build macOS wheels
-    runs-on: macos-latest
+  build-macos-arm-wheels:
+    name: Build macOS ARM64 wheels
+    runs-on: macos-latest  # ARM runner (M1/M2)
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +60,33 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos
+          name: wheels-macos-arm
+          path: dist/*.whl
+
+  build-macos-x64-wheels:
+    name: Build macOS x64 wheels
+    runs-on: macos-13  # Intel runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build ABI3 wheels (Python 3.8+)
+        run: maturin build --release --target x86_64-apple-darwin --out dist --features python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-x64
           path: dist/*.whl
 
   build-windows-wheels:
@@ -115,9 +139,9 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [build-linux-wheels, build-macos-wheels, build-windows-wheels, build-sdist]
+    needs: [build-linux-wheels, build-macos-arm-wheels, build-macos-x64-wheels, build-windows-wheels, build-sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.event.inputs.publish == 'true'
+    if: github.event.inputs.publish == 'true'
     environment:
       name: pypi
       url: https://pypi.org/project/shodh-memory/

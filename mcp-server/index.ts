@@ -20,6 +20,13 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { spawn, ChildProcess } from "child_process";
+import * as path from "path";
+import * as fs from "fs";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Configuration
 const API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
@@ -1658,8 +1665,117 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 });
 
+// =============================================================================
+// AUTO-SPAWN SERVER - Automatically start backend if not running
+// =============================================================================
+
+// Disable auto-spawn with SHODH_NO_AUTO_SPAWN=true
+const AUTO_SPAWN_ENABLED = process.env.SHODH_NO_AUTO_SPAWN !== "true";
+
+let serverProcess: ChildProcess | null = null;
+
+function getBinaryPath(): string | null {
+  const platform = process.platform;
+  const binDir = path.join(__dirname, "..", "bin");
+
+  let binaryName: string;
+  if (platform === "win32") {
+    binaryName = "shodh-memory-server.exe";
+  } else {
+    binaryName = "shodh-memory-server";
+  }
+
+  const binaryPath = path.join(binDir, binaryName);
+
+  if (fs.existsSync(binaryPath)) {
+    return binaryPath;
+  }
+
+  return null;
+}
+
+async function isServerRunning(): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+
+    const response = await fetch(`${API_URL}/health`, {
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForServer(maxAttempts: number = 30): Promise<boolean> {
+  for (let i = 0; i < maxAttempts; i++) {
+    if (await isServerRunning()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+async function ensureServerRunning(): Promise<void> {
+  // Check if already running
+  if (await isServerRunning()) {
+    console.error("[shodh-memory] Backend server already running at", API_URL);
+    return;
+  }
+
+  if (!AUTO_SPAWN_ENABLED) {
+    console.error("[shodh-memory] Auto-spawn disabled. Please start the server manually.");
+    return;
+  }
+
+  const binaryPath = getBinaryPath();
+  if (!binaryPath) {
+    console.error("[shodh-memory] Server binary not found. Please run: npx @shodh/memory-mcp");
+    console.error("[shodh-memory] Or download from: https://github.com/varun29ankuS/shodh-memory/releases");
+    return;
+  }
+
+  console.error("[shodh-memory] Starting backend server...");
+
+  // Spawn the server process
+  serverProcess = spawn(binaryPath, [], {
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      SHODH_DEV_API_KEY: API_KEY, // Pass the API key to the server
+    },
+  });
+
+  serverProcess.unref();
+
+  // Wait for server to become available
+  console.error("[shodh-memory] Waiting for server to start...");
+  const started = await waitForServer();
+
+  if (started) {
+    console.error("[shodh-memory] Backend server started successfully");
+  } else {
+    console.error("[shodh-memory] Warning: Server may not have started properly");
+  }
+}
+
+// Cleanup on exit
+process.on("exit", () => {
+  if (serverProcess && !serverProcess.killed) {
+    serverProcess.kill();
+  }
+});
+
 // Start server
 async function main() {
+  // Ensure backend is running
+  await ensureServerRunning();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Shodh-Memory MCP server v0.1.5 running");

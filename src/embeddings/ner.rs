@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 
+
 /// BIO tag labels from TinyBERT-finetuned-NER-ONNX
 /// Index mapping: O=0, B-MISC=1, I-MISC=2, B-ORG=3, I-ORG=4, B-LOC=5, I-LOC=6, B-PER=7, I-PER=8
 /// Note: This ordering differs from bert-base-NER (dslim) which uses MISC, PER, ORG, LOC
@@ -157,15 +158,24 @@ impl NerConfig {
         let base_path = std::env::var("SHODH_NER_MODEL_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                // Try common locations
-                let candidates = [
-                    PathBuf::from("./models/bert-tiny-ner"),
-                    PathBuf::from("../models/bert-tiny-ner"),
-                    super::downloader::get_ner_models_dir(),
+                // Try common locations - bundled package dir has highest priority
+                let candidates: Vec<Option<PathBuf>> = vec![
+                    // Bundled in Python package (highest priority for pip install)
+                    std::env::var("SHODH_PACKAGE_DIR")
+                        .ok()
+                        .map(|p| PathBuf::from(p).join("models/bert-tiny-ner")),
+                    // Local development paths
+                    Some(PathBuf::from("./models/bert-tiny-ner")),
+                    Some(PathBuf::from("../models/bert-tiny-ner")),
+                    // Downloaded models cache
+                    Some(super::downloader::get_ner_models_dir()),
+                    // System data directory
+                    dirs::data_dir().map(|p| p.join("shodh-memory/models/bert-tiny-ner")),
                 ];
 
                 candidates
                     .into_iter()
+                    .flatten()
                     .find(|p| p.join("model.onnx").exists())
                     .unwrap_or_else(super::downloader::get_ner_models_dir)
             });
@@ -205,9 +215,9 @@ impl LazyNerModel {
         );
 
         let session = Session::builder()
-            .context("Failed to create ONNX session builder")?
+            .context("Failed to create NER session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set intra threads")?
+            .context("Failed to set NER thread count")?
             .commit_from_file(&config.model_path)
             .context("Failed to load NER ONNX model")?;
 
@@ -342,19 +352,23 @@ impl NeuralNer {
         // token_type_ids: all zeros for single sentence (BERT segment embedding)
         let token_type_ids = vec![0i64; max_length];
 
-        let input_ids_value = Value::from_array((vec![1, max_length], input_ids))?;
-        let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))?;
-        let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))?;
+        let input_ids_value = Value::from_array((vec![1, max_length], input_ids))
+            .context("Failed to create input_ids tensor")?;
+        let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))
+            .context("Failed to create attention_mask tensor")?;
+        let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))
+            .context("Failed to create token_type_ids tensor")?;
 
         // Run inference
         let outputs = session.run(ort::inputs![
             "input_ids" => &input_ids_value,
             "attention_mask" => &attention_mask_value,
             "token_type_ids" => &token_type_ids_value,
-        ])?;
+        ]).context("NER inference failed")?;
 
         // Extract logits - shape: [1, seq_len, num_labels]
-        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
+        let output_tensor = outputs[0].try_extract_tensor::<f32>()
+            .context("Failed to extract NER output tensor")?;
         let (_shape, logits) = output_tensor;
 
         // Decode BIO tags to entities

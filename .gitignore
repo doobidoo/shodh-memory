@@ -58,3 +58,15 @@ literature/
 
 # Paper (not for public release)
 paper/
+
+# ONNX Runtime binaries (downloaded per-platform during CI wheel builds)
+python/shodh_memory/lib/*.dll
+python/shodh_memory/lib/*.so
+python/shodh_memory/lib/*.dylib
+!python/shodh_memory/lib/__init__.py
+
+# Model files (downloaded during CI wheel builds)
+python/shodh_memory/models/minilm-l6/*.onnx
+python/shodh_memory/models/minilm-l6/*.json
+python/shodh_memory/models/bert-tiny-ner/*.onnx
+python/shodh_memory/models/bert-tiny-ner/*.json

@@ -7,7 +7,7 @@ description = "Persistent memory for AI agents and edge devices - 3-tier memory,
 license = "Apache-2.0"
 repository = "https://github.com/varun29ankuS/shodh-memory"
 homepage = "https://github.com/varun29ankuS/shodh-memory"
-readme = "README.md"
+readme = "README-rust.md"
 keywords = ["memory", "ai", "llm", "embedding", "cognitive"]
 categories = ["science", "database", "embedded"]
 exclude = [
@@ -94,9 +94,9 @@ memmap2 = "0.9"
 rand = "0.8"
 
 # ONNX Runtime for embeddings (MiniLM-L6-v2)
-# Using load-dynamic to avoid Windows CRT linking conflicts
-# Note: Set ORT_DYLIB_PATH to the onnxruntime 1.22 DLL location
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["half", "load-dynamic"] }
+# Using load-dynamic for runtime DLL loading (bundled in wheels)
+# CRT conflicts solved via .cargo/config.toml: -crt-static
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "half"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 ndarray = "0.15"
 

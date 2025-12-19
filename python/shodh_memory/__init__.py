@@ -33,6 +33,14 @@ LLM Framework Integrations:
     # Both - pip install shodh-memory[all]
 """
 
+import os as _os
+from pathlib import Path as _Path
+
+# Set package directory for bundled ONNX Runtime discovery
+# This allows the Rust code to find lib/onnxruntime.dll bundled in the wheel
+_package_dir = _Path(__file__).parent
+_os.environ.setdefault("SHODH_PACKAGE_DIR", str(_package_dir))
+
 from .shodh_memory import (
     MemorySystem,
     # Location types
