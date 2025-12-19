@@ -1678,15 +1678,25 @@ function getBinaryPath(): string | null {
   const platform = process.platform;
   const binDir = path.join(__dirname, "..", "bin");
 
-  let binaryName: string;
+  // Use wrapper script that sets up library paths for bundled ONNX Runtime
+  let wrapperName: string;
+  let fallbackName: string;
   if (platform === "win32") {
-    binaryName = "shodh-memory-server.exe";
+    wrapperName = "shodh-memory.bat";
+    fallbackName = "shodh-memory-server.exe";
   } else {
-    binaryName = "shodh-memory-server";
+    wrapperName = "shodh-memory";
+    fallbackName = "shodh-memory-server";
   }
 
-  const binaryPath = path.join(binDir, binaryName);
+  // Try wrapper first (includes ONNX Runtime setup)
+  const wrapperPath = path.join(binDir, wrapperName);
+  if (fs.existsSync(wrapperPath)) {
+    return wrapperPath;
+  }
 
+  // Fallback to direct binary (requires system ONNX Runtime)
+  const binaryPath = path.join(binDir, fallbackName);
   if (fs.existsSync(binaryPath)) {
     return binaryPath;
   }

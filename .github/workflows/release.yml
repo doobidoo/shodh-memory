@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ORT_VERSION: "1.22.0"
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -19,15 +22,27 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: shodh-memory-linux-x64
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+            ort_lib: libonnxruntime.so.1.22.0
+            ort_lib_name: libonnxruntime.so
           - target: x86_64-apple-darwin
-            os: macos-latest  # Cross-compile x64 from ARM (macos-13 retired)
+            os: macos-latest
             name: shodh-memory-macos-x64
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-x86_64-1.22.0.tgz
+            ort_lib: libonnxruntime.1.22.0.dylib
+            ort_lib_name: libonnxruntime.dylib
           - target: aarch64-apple-darwin
-            os: macos-latest  # ARM Mac runner (M1/M2)
+            os: macos-latest
             name: shodh-memory-macos-arm64
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-arm64-1.22.0.tgz
+            ort_lib: libonnxruntime.1.22.0.dylib
+            ort_lib_name: libonnxruntime.dylib
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: shodh-memory-windows-x64
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip
+            ort_lib: onnxruntime.dll
+            ort_lib_name: onnxruntime.dll
 
     steps:
       - uses: actions/checkout@v4
@@ -38,20 +53,77 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Download ONNX Runtime (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          curl -L -o ort.tgz "${{ matrix.ort_url }}"
+          tar -xzf ort.tgz
+          ORT_DIR=$(find . -maxdepth 1 -type d -name "onnxruntime-*" | head -1)
+          cp "$ORT_DIR/lib/${{ matrix.ort_lib }}" ./${{ matrix.ort_lib_name }}
+          echo "ORT_DYLIB_PATH=$PWD/${{ matrix.ort_lib_name }}" >> $GITHUB_ENV
+
+      - name: Download ONNX Runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ matrix.ort_url }}" -OutFile ort.zip
+          Expand-Archive -Path ort.zip -DestinationPath .
+          $ortDir = Get-ChildItem -Directory -Filter "onnxruntime-*" | Select-Object -First 1
+          Copy-Item "$($ortDir.FullName)\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
+          echo "ORT_DYLIB_PATH=$PWD\onnxruntime.dll" >> $env:GITHUB_ENV
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
+      - name: Package (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf ../../../${{ matrix.name }}.tar.gz shodh-memory-server
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/shodh-memory-server package/
+          cp ${{ matrix.ort_lib_name }} package/
+          # Create wrapper script
+          cat > package/shodh-memory << 'EOF'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
+          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
+          EOF
+          chmod +x package/shodh-memory
+          chmod +x package/shodh-memory-server
+          tar -czvf ${{ matrix.name }}.tar.gz -C package .
+
+      - name: Package (macOS)
+        if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
+        run: |
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/shodh-memory-server package/
+          cp ${{ matrix.ort_lib_name }} package/
+          # Create wrapper script
+          cat > package/shodh-memory << 'EOF'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          export DYLD_LIBRARY_PATH="$SCRIPT_DIR:$DYLD_LIBRARY_PATH"
+          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
+          EOF
+          chmod +x package/shodh-memory
+          chmod +x package/shodh-memory-server
+          tar -czvf ${{ matrix.name }}.tar.gz -C package .
 
       - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          Compress-Archive -Path shodh-memory-server.exe -DestinationPath ../../../${{ matrix.name }}.zip
+          New-Item -ItemType Directory -Force -Path package
+          Copy-Item "target\${{ matrix.target }}\release\shodh-memory-server.exe" -Destination "package\"
+          Copy-Item "onnxruntime.dll" -Destination "package\"
+          # Create batch wrapper
+          @"
+          @echo off
+          set "SCRIPT_DIR=%~dp0"
+          set "PATH=%SCRIPT_DIR%;%PATH%"
+          "%SCRIPT_DIR%shodh-memory-server.exe" %*
+          "@ | Out-File -FilePath "package\shodh-memory.bat" -Encoding ASCII
+          Compress-Archive -Path "package\*" -DestinationPath "${{ matrix.name }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
