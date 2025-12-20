@@ -89,7 +89,7 @@ jobs:
 
   build-macos-x64-wheels:
     name: Build macOS x64 wheels
-    runs-on: macos-13  # Intel runner
+    runs-on: macos-15  # Uses Rosetta for x64 cross-compilation
     steps:
       - uses: actions/checkout@v4
 
