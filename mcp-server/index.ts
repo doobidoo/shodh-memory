@@ -361,7 +361,8 @@ async function apiCall<T>(
         method,
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": API_KEY,
+          // Cloudflare Worker uses Bearer auth
+          "Authorization": `Bearer ${API_KEY}`,
         },
         signal: controller.signal,
       };
@@ -408,18 +409,31 @@ async function apiCall<T>(
 
 // Check if server is available
 async function isServerAvailable(): Promise<boolean> {
+  // Try root endpoint first (no auth required for Cloudflare Worker)
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-    const response = await fetch(`${API_URL}/health`, {
+    const response = await fetch(`${API_URL}/`, {
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
-
     return response.ok;
   } catch {
-    return false;
+    // Try /api/stats as fallback (with auth)
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const response = await fetch(`${API_URL}/api/stats`, {
+        signal: controller.signal,
+        headers: {
+          "Authorization": `Bearer ${API_KEY}`,
+        },
+      });
+      clearTimeout(timeoutId);
+      return response.ok;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -1480,10 +1494,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_items?: number;
         };
 
-        // Fetch all memories
-        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-          user_id: USER_ID,
-        });
+        // Fetch all memories (Cloudflare Worker uses GET with query params)
+        const result = await apiCall<{ memories: Memory[] }>(
+          `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=100`,
+          "GET"
+        );
 
         const memories = result.memories || [];
 
@@ -1584,9 +1599,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "list_memories": {
         const { limit = 20 } = args as { limit?: number };
 
-        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-          user_id: USER_ID,
-        });
+        // Cloudflare Worker uses GET with query params
+        const result = await apiCall<{ memories: Memory[] }>(
+          `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=${limit}`,
+          "GET"
+        );
 
         const memories = (result.memories || []).slice(0, limit);
 
@@ -1643,7 +1660,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "forget": {
         const { id } = args as { id: string };
 
-        await apiCall(`/api/memory/${id}?user_id=${USER_ID}`, "DELETE");
+        // Cloudflare Worker uses /api/forget/:id
+        await apiCall(`/api/forget/${id}?user_id=${USER_ID}`, "DELETE");
 
         let response = `🐘 Memory Deleted\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -1983,57 +2001,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tags: string[];
         }
 
-        interface RelevanceResponse {
-          memories: SurfacedMemory[];
-          detected_entities: DetectedEntity[];
-          latency_ms: number;
-          config_used: {
-            semantic_threshold: number;
-            entity_match_weight: number;
-            semantic_weight: number;
-            recency_weight: number;
-            max_results: number;
-            recency_half_life_hours: number;
-            memory_types: string[];
-          };
+        // Cloudflare Worker response format
+        interface CloudflareContextResponse {
+          surfaced_memories: SurfacedMemory[];
+          count: number;
+          ingested: boolean;
+          ingested_id?: string;
         }
 
-        const result = await apiCall<RelevanceResponse>("/api/relevant", "POST", {
+        // Cloudflare Worker uses /api/context
+        const result = await apiCall<CloudflareContextResponse>("/api/context", "POST", {
           user_id: USER_ID,
           context,
-          config: {
-            semantic_threshold,
-            entity_match_weight,
-            semantic_weight: 1.0 - entity_match_weight - recency_weight,
-            recency_weight,
-            max_results,
-            memory_types,
-          },
+          max_results,
+          auto_ingest,
         });
 
-        const memories = result.memories || [];
-        const entities = result.detected_entities || [];
+        const memories = result.surfaced_memories || [];
+        const entities: DetectedEntity[] = []; // Cloudflare doesn't return entities
 
         if (memories.length === 0) {
-          // No relevant memories, but show detected entities if any
-          if (entities.length > 0) {
-            const entityList = entities
-              .map(e => `  - "${e.text}" (${e.entity_type}, ${(e.confidence * 100).toFixed(0)}% confidence)`)
-              .join('\n');
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `No relevant memories surfaced for this context.\n\nDetected entities:\n${entityList}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms]`,
-                },
-              ],
-            };
-          }
           return {
             content: [
               {
                 type: "text",
-                text: `No relevant memories surfaced for this context.\n\n[Latency: ${result.latency_ms.toFixed(1)}ms]`,
+                text: `No relevant memories surfaced for this context.`,
               },
             ],
           };
@@ -2149,11 +2141,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Format memories with relative timestamps for temporal reasoning
         const formattedWithTime = memories
           .map((m, i) => {
-            const score = (m.relevance_score * 100).toFixed(0);
-            const entityMatchStr = (m.matched_entities && m.matched_entities.length > 0)
-              ? `\n   Entity matches: ${m.matched_entities.join(', ')}`
-              : '';
-            const semScore = (m.semantic_similarity * 100).toFixed(0);
+            const score = ((m.relevance_score || 0) * 100).toFixed(0);
+            const tagsStr = (m.tags && m.tags.length > 0) ? ` | tags: ${m.tags.join(', ')}` : '';
 
             // Calculate relative time
             let timeStr = '';
@@ -2172,7 +2161,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }
             }
 
-            return `• [${score}%]${timeStr} ${m.content.slice(0, 100)}${m.content.length > 100 ? '...' : ''}\n   Type: ${m.memory_type} | semantic=${semScore}% | reason: ${m.relevance_reason}${entityMatchStr}`;
+            return `• [${score}%]${timeStr} ${m.content.slice(0, 150)}${m.content.length > 150 ? '...' : ''}\n   Type: ${m.memory_type}${tagsStr}`;
           })
           .join("\n\n");
 
@@ -2180,7 +2169,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `${temporalHeader}Surfaced ${memories.length} relevant memories:\n\n${formattedWithTime}${entitySummary}${reminderBlock}${todoBlock}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms | Threshold: ${(semantic_threshold * 100).toFixed(0)}%]`,
+              text: `${temporalHeader}Surfaced ${memories.length} relevant memories:\n\n${formattedWithTime}${entitySummary}${reminderBlock}${todoBlock}`,
             },
           ],
         };
@@ -2968,8 +2957,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let memory: MemoryWithHierarchy | null = null;
 
         try {
+          // Cloudflare Worker uses /api/memories/:id
           memory = await apiCall<MemoryWithHierarchy>(
-            `/api/memory/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
+            `/api/memories/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
             "GET"
           );
         } catch {
@@ -3118,9 +3108,11 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   ];
 
   try {
-    const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-      user_id: USER_ID,
-    });
+    // Cloudflare Worker uses GET with query params
+    const result = await apiCall<{ memories: Memory[] }>(
+      `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=30`,
+      "GET"
+    );
 
     const memories = result.memories || [];
     const memoryResources = memories.slice(0, 30).map((m) => {
@@ -3302,13 +3294,18 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
     }
 
-    // Handle memory:// resources
+    // Handle memory:// resources - fetch directly by ID
     const memoryId = uri.replace("memory://", "");
-    const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-      user_id: USER_ID,
-    });
-
-    const memory = (result.memories || []).find((m) => m.id === memoryId);
+    let memory: Memory | null = null;
+    try {
+      // Cloudflare Worker uses GET /api/memories/:id
+      memory = await apiCall<Memory>(
+        `/api/memories/${memoryId}?user_id=${encodeURIComponent(USER_ID)}`,
+        "GET"
+      );
+    } catch {
+      // Not found
+    }
 
     if (!memory) {
       throw new Error(`Memory not found: ${memoryId}`);
@@ -3578,10 +3575,11 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
 
       case "recent_memories": {
         const count = parseInt((args.count as string) || "10", 10);
-        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-          user_id: USER_ID,
-          limit: count,
-        });
+        // Cloudflare Worker uses GET with query params
+        const result = await apiCall<{ memories: Memory[] }>(
+          `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=${count}`,
+          "GET"
+        );
         const memories = result.memories || [];
         if (memories.length === 0) {
           return {
@@ -3749,14 +3747,13 @@ function getBinaryPath(): string | null {
 }
 
 async function isServerRunning(): Promise<boolean> {
+  // Try root endpoint first (no auth required for Cloudflare Worker)
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2000);
-
-    const response = await fetch(`${API_URL}/health`, {
+    const response = await fetch(`${API_URL}/`, {
       signal: controller.signal,
     });
-
     clearTimeout(timeout);
     return response.ok;
   } catch {
