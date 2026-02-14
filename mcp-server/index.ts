@@ -98,10 +98,6 @@ const STREAM_MIN_CONTENT_LENGTH = 50; // minimum content length to stream
 const PROACTIVE_SURFACING = process.env.SHODH_PROACTIVE !== "false"; // enabled by default
 const PROACTIVE_MIN_CONTEXT_LENGTH = 30; // minimum context length to trigger surfacing
 
-// Track last proactive_context response for implicit feedback loop
-// The backend uses this to evaluate whether surfaced memories were helpful
-let lastProactiveResponse: string = "";
-
 // =============================================================================
 // STREAMING MEMORY INGESTION - Continuous background memory capture
 // =============================================================================
@@ -214,13 +210,11 @@ function streamMemory(content: string, tags: string[] = [], source: string = "as
     streamSocket.send(message);
     console.error(`[Stream] Sent memory (${content.length} chars) with tags:`, tags);
   } else {
-    // Buffer message with FIFO eviction and try to reconnect
-    if (streamBuffer.length >= MAX_BUFFER_SIZE) {
-      streamBuffer.shift();
-      console.error(`[Stream] Buffer full, evicted oldest message (size: ${MAX_BUFFER_SIZE})`);
+    // Buffer message and try to reconnect
+    if (streamBuffer.length < MAX_BUFFER_SIZE) {
+      streamBuffer.push(message);
+      console.error(`[Stream] Buffered memory (socket not ready, buffer size: ${streamBuffer.length})`);
     }
-    streamBuffer.push(message);
-    console.error(`[Stream] Buffered memory (socket not ready, buffer size: ${streamBuffer.length})`);
     connectStream().catch(() => {});
   }
 }
@@ -367,7 +361,8 @@ async function apiCall<T>(
         method,
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": API_KEY,
+          // Cloudflare Worker uses Bearer auth
+          "Authorization": `Bearer ${API_KEY}`,
         },
         signal: controller.signal,
       };
@@ -414,18 +409,31 @@ async function apiCall<T>(
 
 // Check if server is available
 async function isServerAvailable(): Promise<boolean> {
+  // Try root endpoint first (no auth required for Cloudflare Worker)
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-    const response = await fetch(`${API_URL}/health`, {
+    const response = await fetch(`${API_URL}/`, {
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
-
     return response.ok;
   } catch {
-    return false;
+    // Try /api/stats as fallback (with auth)
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const response = await fetch(`${API_URL}/api/stats`, {
+        signal: controller.signal,
+        headers: {
+          "Authorization": `Bearer ${API_KEY}`,
+        },
+      });
+      clearTimeout(timeoutId);
+      return response.ok;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -1486,10 +1494,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_items?: number;
         };
 
-        // Fetch all memories
-        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-          user_id: USER_ID,
-        });
+        // Fetch all memories (Cloudflare Worker uses GET with query params)
+        const result = await apiCall<{ memories: Memory[] }>(
+          `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=100`,
+          "GET"
+        );
 
         const memories = result.memories || [];
 
@@ -1590,9 +1599,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "list_memories": {
         const { limit = 20 } = args as { limit?: number };
 
-        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-          user_id: USER_ID,
-        });
+        // Cloudflare Worker uses GET with query params
+        const result = await apiCall<{ memories: Memory[] }>(
+          `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=${limit}`,
+          "GET"
+        );
 
         const memories = (result.memories || []).slice(0, limit);
 
@@ -1649,7 +1660,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "forget": {
         const { id } = args as { id: string };
 
-        await apiCall(`/api/memory/${id}?user_id=${USER_ID}`, "DELETE");
+        // Cloudflare Worker uses /api/forget/:id
+        await apiCall(`/api/forget/${id}?user_id=${USER_ID}`, "DELETE");
 
         let response = `🐘 Memory Deleted\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -1962,130 +1974,105 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           auto_ingest?: boolean;
         };
 
-        // --- Response types matching ProactiveContextResponse (Rust backend) ---
+        // Stream context to memory (non-blocking, uses WebSocket)
+        if (auto_ingest && context.length > 100) {
+          streamMemory(context.slice(0, 2000), ["proactive-context"]);
+          // Flush immediately to ensure context is persisted (don't wait for checkpoint)
+          streamFlush();
+        }
 
-        interface ProactiveSurfacedMemory {
+        interface DetectedEntity {
+          text: string;
+          entity_type: string;
+          confidence: number;
+          matched_memories: number;
+        }
+
+        interface SurfacedMemory {
           id: string;
           content: string;
           memory_type: string;
-          score: number;
           importance: number;
-          created_at: string;
-          tags: string[];
+          relevance_score: number;
           relevance_reason: string;
           matched_entities: string[];
-        }
-
-        interface ReminderItem {
-          id: string;
-          content: string;
-          trigger_type: string;
-          status: string;
-          due_at: string | null;
+          semantic_similarity: number;
           created_at: string;
-          triggered_at: string | null;
-          dismissed_at: string | null;
-          priority: number;
           tags: string[];
-          overdue_seconds: number | null;
         }
 
-        interface FeedbackProcessed {
-          memories_evaluated: number;
-          reinforced: string[];
-          weakened: string[];
+        // Cloudflare Worker response format
+        interface CloudflareContextResponse {
+          surfaced_memories: SurfacedMemory[];
+          count: number;
+          ingested: boolean;
+          ingested_id?: string;
         }
 
-        interface ProactiveTodoItem {
-          id: string;
-          short_id: string;
-          content: string;
-          status: string;
-          priority: string;
-          project: string | null;
-          due_date: string | null;
-          relevance_reason: string;
-          similarity_score: number | null;
-        }
-
-        interface DetectedEntityInfo {
-          name: string;
-          entity_type: string;
-        }
-
-        interface ProactiveFact {
-          id: string;
-          fact: string;
-          confidence: number;
-          support_count: number;
-          related_entities: string[];
-        }
-
-        interface ProactiveContextResponse {
-          memories: ProactiveSurfacedMemory[];
-          due_reminders: ReminderItem[];
-          context_reminders: ReminderItem[];
-          memory_count: number;
-          reminder_count: number;
-          ingested_memory_id: string | null;
-          feedback_processed: FeedbackProcessed | null;
-          relevant_todos: ProactiveTodoItem[];
-          todo_count: number;
-          relevant_facts: ProactiveFact[];
-          latency_ms: number;
-          detected_entities: DetectedEntityInfo[];
-        }
-
-        // Single API call to the full proactive context pipeline:
-        // feedback loop, coactivation, segmented ingest, semantic todos, context reminders
-        const result = await apiCall<ProactiveContextResponse>("/api/proactive_context", "POST", {
+        // Cloudflare Worker uses /api/context
+        const result = await apiCall<CloudflareContextResponse>("/api/context", "POST", {
           user_id: USER_ID,
           context,
           max_results,
-          semantic_threshold,
-          entity_match_weight,
-          recency_weight,
-          memory_types,
           auto_ingest,
-          // Implicit feedback: send previous response so backend can evaluate which memories helped
-          previous_response: lastProactiveResponse || undefined,
-          user_followup: lastProactiveResponse ? context : undefined,
         });
 
-        const memories = result.memories || [];
-        const entities = result.detected_entities || [];
+        const memories = result.surfaced_memories || [];
+        const entities: DetectedEntity[] = []; // Cloudflare doesn't return entities
 
-        const facts = result.relevant_facts || [];
-        if (memories.length === 0 && result.reminder_count === 0 && result.todo_count === 0 && facts.length === 0) {
-          const entityList = entities.length > 0
-            ? `\n\nDetected entities: ${entities.map(e => `"${e.name}" (${e.entity_type})`).join(', ')}`
-            : '';
-          const feedbackNote = result.feedback_processed
-            ? `\n[Feedback: ${result.feedback_processed.memories_evaluated} evaluated, ${result.feedback_processed.reinforced.length} reinforced, ${result.feedback_processed.weakened.length} weakened]`
-            : '';
-
-          const emptyText = `No relevant memories surfaced for this context.${entityList}${feedbackNote}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms]`;
-          lastProactiveResponse = emptyText;
-
+        if (memories.length === 0) {
           return {
-            content: [{ type: "text", text: emptyText }],
+            content: [
+              {
+                type: "text",
+                text: `No relevant memories surfaced for this context.`,
+              },
+            ],
           };
         }
 
         // Format detected entities summary
         const entitySummary = entities.length > 0
-          ? `\n\nDetected entities: ${entities.map(e => `"${e.name}" (${e.entity_type})`).join(', ')}`
+          ? `\n\nDetected entities: ${entities.map(e => `"${e.text}" (${e.entity_type})`).join(', ')}`
           : '';
 
-        // Format reminders from unified response (due + context-triggered)
+        // Check for due reminders and context-triggered reminders (SHO-116)
         let reminderBlock = "";
-        {
-          const allReminders = [...(result.due_reminders || []), ...(result.context_reminders || [])];
+        try {
+          // Check time-based due reminders
+          interface ReminderItem {
+            id: string;
+            content: string;
+            trigger_type: string;
+            priority: number;
+            overdue_seconds: number | null;
+            due_at: string | null;
+          }
+          interface DueRemindersResponse {
+            reminders: ReminderItem[];
+            count: number;
+          }
+
+          const dueResult = await apiCall<DueRemindersResponse>("/api/reminders/due", "POST", {
+            user_id: USER_ID,
+            mark_triggered: false,  // Don't auto-trigger, let user dismiss manually
+          });
+
+          // Check context-triggered reminders
+          const contextResult = await apiCall<DueRemindersResponse>("/api/reminders/context", "POST", {
+            user_id: USER_ID,
+            context,
+            mark_triggered: false,  // Don't auto-trigger, let user dismiss manually
+          });
+
+          // Combine all triggered reminders
+          const allReminders = [...dueResult.reminders, ...contextResult.reminders];
           const uniqueReminders = allReminders.filter((r, i, arr) =>
             arr.findIndex(x => x.id === r.id) === i
           );
 
           if (uniqueReminders.length > 0) {
+            // 54 chars wide box
             reminderBlock = `\n\n`;
             reminderBlock += `🐘━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━🧠\n`;
             reminderBlock += `┃  SHODH MEMORY                    REMINDERS (${String(uniqueReminders.length).padStart(2)})  ┃\n`;
@@ -2111,38 +2098,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             reminderBlock += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n`;
             reminderBlock += `\n💡 Use dismiss_reminder with the [id] shown above`;
           }
+        } catch (e) {
+          // Log reminder check failures for debugging
+          console.error("[proactive_context] Reminder check failed:", e);
         }
 
-        // Format todos from unified response (semantic + in_progress)
+        // Check for due todos (GTD integration)
         let todoBlock = "";
-        {
-          const todos = result.relevant_todos || [];
-          if (todos.length > 0) {
-            todoBlock = "\n\n📋 Relevant Todos:\n";
-            for (const t of todos) {
-              const statusIcon = t.status === "in_progress" ? "🔄" : t.status === "blocked" ? "🚫" : "☐";
-              const proj = t.project ? ` [${t.project}]` : "";
-              const due = t.due_date ? ` (due: ${t.due_date})` : "";
-              todoBlock += `  ${statusIcon} ${t.priority} ${t.short_id}: ${t.content.slice(0, 60)}${t.content.length > 60 ? '...' : ''}${proj}${due}\n`;
-              todoBlock += `     ${t.relevance_reason}\n`;
-            }
+        try {
+          interface DueTodoItem {
+            id: string;
+            content: string;
+            status: string;
+            priority: string;
+            due_date: string | null;
+            project_name: string | null;
           }
-        }
+          interface DueTodosResponse {
+            todos: DueTodoItem[];
+            formatted: string;
+            count: number;
+          }
 
-        // Format consolidated facts from knowledge graph
-        let factsBlock = "";
-        {
-          const facts = (result.relevant_facts || [])
-            .filter((f: ProactiveFact) => f.confidence >= 0.4);
-          if (facts.length > 0) {
-            factsBlock = "\n\n🧠 Known Facts:\n";
-            for (const f of facts) {
-              const conf = (f.confidence * 100).toFixed(0);
-              const entities = f.related_entities.length > 0 ? ` [${f.related_entities.slice(0, 3).join(', ')}]` : '';
-              const factText = f.fact.length > 120 ? f.fact.slice(0, 120) + '...' : f.fact;
-              factsBlock += `  • (${conf}%) ${factText}${entities}\n`;
-            }
+          const dueTodosResult = await apiCall<DueTodosResponse>("/api/todos/due", "POST", {
+            user_id: USER_ID,
+          });
+
+          if (dueTodosResult.count > 0) {
+            todoBlock = "\n\n" + dueTodosResult.formatted;
           }
+        } catch (e) {
+          // Log todo check failures for debugging
+          console.error("[proactive_context] Todo check failed:", e);
         }
 
         // Add temporal framing - helps AI reason about time
@@ -2154,13 +2141,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Format memories with relative timestamps for temporal reasoning
         const formattedWithTime = memories
           .map((m, i) => {
-            const score = (m.score * 100).toFixed(0);
-            const entityMatchStr = (m.matched_entities && m.matched_entities.length > 0)
-              ? `\n   Matched: ${m.matched_entities.join(', ')}`
-              : '';
-            const tagsStr = (m.tags && m.tags.length > 0)
-              ? `\n   Tags: ${m.tags.slice(0, 5).join(', ')}`
-              : '';
+            const score = ((m.relevance_score || 0) * 100).toFixed(0);
+            const tagsStr = (m.tags && m.tags.length > 0) ? ` | tags: ${m.tags.join(', ')}` : '';
 
             // Calculate relative time
             let timeStr = '';
@@ -2179,42 +2161,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }
             }
 
-            const importanceBar = m.importance >= 0.8 ? '🔴' : m.importance >= 0.5 ? '🟡' : '⚪';
-            // Truncate at sentence boundary within 200 chars for cleaner display
-            let preview = m.content;
-            if (preview.length > 200) {
-              const sentenceEnd = preview.slice(0, 200).lastIndexOf('. ');
-              preview = sentenceEnd > 80 ? preview.slice(0, sentenceEnd + 1) : preview.slice(0, 200) + '...';
-            }
-            return `${i + 1}. ${importanceBar} [${score}%]${timeStr} ${preview}\n   ${m.memory_type} | ${m.relevance_reason}${entityMatchStr}${tagsStr}`;
+            return `• [${score}%]${timeStr} ${m.content.slice(0, 150)}${m.content.length > 150 ? '...' : ''}\n   Type: ${m.memory_type}${tagsStr}`;
           })
           .join("\n\n");
 
-        // Feedback loop status
-        const feedbackNote = result.feedback_processed
-          ? `\n[Feedback loop: ${result.feedback_processed.memories_evaluated} evaluated, ${result.feedback_processed.reinforced.length} reinforced, ${result.feedback_processed.weakened.length} weakened]`
-          : '';
-
-        // Ingestion confirmation
-        const ingestNote = result.ingested_memory_id
-          ? `\n[Context ingested: ${result.ingested_memory_id.slice(0, 8)}]`
-          : '';
-
-        // Summary counts
-        const summaryParts: string[] = [];
-        if (memories.length > 0) summaryParts.push(`${memories.length} memories`);
-        if (facts.length > 0) summaryParts.push(`${facts.length} facts`);
-        if (result.todo_count > 0) summaryParts.push(`${result.todo_count} todos`);
-        if (result.reminder_count > 0) summaryParts.push(`${result.reminder_count} reminders`);
-        const summary = summaryParts.length > 0 ? `Surfaced ${summaryParts.join(', ')}` : 'No relevant context found';
-
-        const responseText = `${temporalHeader}${summary}:\n\n${formattedWithTime}${entitySummary}${factsBlock}${reminderBlock}${todoBlock}${feedbackNote}${ingestNote}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms | Threshold: ${(semantic_threshold * 100).toFixed(0)}%]`;
-
-        // Store for implicit feedback on next call
-        lastProactiveResponse = responseText;
-
         return {
-          content: [{ type: "text", text: responseText }],
+          content: [
+            {
+              type: "text",
+              text: `${temporalHeader}Surfaced ${memories.length} relevant memories:\n\n${formattedWithTime}${entitySummary}${reminderBlock}${todoBlock}`,
+            },
+          ],
         };
       }
 
@@ -2838,7 +2795,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           formatted: string;
         }
 
-        const result = await apiCall<ProjectResponse>(`/api/projects/${encodeURIComponent(project)}/delete`, "POST", {
+        const result = await apiCall<ProjectResponse>(`/api/projects/${encodeURIComponent(project)}`, "DELETE", {
           user_id: USER_ID,
           delete_todos: delete_todos ?? false,
         });
@@ -3000,8 +2957,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let memory: MemoryWithHierarchy | null = null;
 
         try {
+          // Cloudflare Worker uses /api/memories/:id
           memory = await apiCall<MemoryWithHierarchy>(
-            `/api/memory/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
+            `/api/memories/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
             "GET"
           );
         } catch {
@@ -3150,9 +3108,11 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   ];
 
   try {
-    const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-      user_id: USER_ID,
-    });
+    // Cloudflare Worker uses GET with query params
+    const result = await apiCall<{ memories: Memory[] }>(
+      `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=30`,
+      "GET"
+    );
 
     const memories = result.memories || [];
     const memoryResources = memories.slice(0, 30).map((m) => {
@@ -3275,7 +3235,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
               content: string;
               status: string;
               priority: string;
-              project_prefix?: string;
+              project?: string;
             }>;
           }>("/api/todos", "POST", {
             user_id: USER_ID,
@@ -3301,7 +3261,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
               parts.push(`\n${status.replace("_", " ").toUpperCase()}:`);
               byStatus[status].forEach((t) => {
                 const priority = t.priority !== "medium" ? ` [${t.priority}]` : "";
-                const project = t.project_prefix ? ` (${t.project_prefix})` : "";
+                const project = t.project ? ` (${t.project})` : "";
                 parts.push(`- ${t.content}${priority}${project}`);
               });
             }
@@ -3334,13 +3294,18 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
     }
 
-    // Handle memory:// resources
+    // Handle memory:// resources - fetch directly by ID
     const memoryId = uri.replace("memory://", "");
-    const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-      user_id: USER_ID,
-    });
-
-    const memory = (result.memories || []).find((m) => m.id === memoryId);
+    let memory: Memory | null = null;
+    try {
+      // Cloudflare Worker uses GET /api/memories/:id
+      memory = await apiCall<Memory>(
+        `/api/memories/${memoryId}?user_id=${encodeURIComponent(USER_ID)}`,
+        "GET"
+      );
+    } catch {
+      // Not found
+    }
 
     if (!memory) {
       throw new Error(`Memory not found: ${memoryId}`);
@@ -3562,7 +3527,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
             content: string;
             status: string;
             priority: string;
-            project_prefix?: string;
+            project?: string;
           }>;
         }>("/api/todos", "POST", {
           user_id: USER_ID,
@@ -3592,7 +3557,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
             parts.push(`\n*${status.replace("_", " ").toUpperCase()}:*`);
             byStatus[status].forEach((t) => {
               const priority = t.priority !== "medium" ? ` [${t.priority}]` : "";
-              const project = t.project_prefix ? ` (${t.project_prefix})` : "";
+              const project = t.project ? ` (${t.project})` : "";
               parts.push(`- ${t.content}${priority}${project}`);
             });
           }
@@ -3610,10 +3575,11 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
 
       case "recent_memories": {
         const count = parseInt((args.count as string) || "10", 10);
-        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
-          user_id: USER_ID,
-          limit: count,
-        });
+        // Cloudflare Worker uses GET with query params
+        const result = await apiCall<{ memories: Memory[] }>(
+          `/api/memories?user_id=${encodeURIComponent(USER_ID)}&limit=${count}`,
+          "GET"
+        );
         const memories = result.memories || [];
         if (memories.length === 0) {
           return {
@@ -3653,7 +3619,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
         }>(`/api/users/${USER_ID}/stats`, "GET");
 
         const verifyResult = await apiCall<{
-          is_healthy: boolean;
+          healthy: boolean;
           orphaned_count: number;
         }>("/api/index/verify", "POST", { user_id: USER_ID });
 
@@ -3661,7 +3627,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
         parts.push(`Total memories: ${statsResult.total_memories || 0}`);
         parts.push(`Last 24h: ${statsResult.memories_last_24h || 0}`);
         parts.push(`Last 7 days: ${statsResult.memories_last_7d || 0}`);
-        parts.push(`\nIndex status: ${verifyResult.is_healthy ? "✓ Healthy" : "⚠ Needs repair"}`);
+        parts.push(`\nIndex status: ${verifyResult.healthy ? "✓ Healthy" : "⚠ Needs repair"}`);
         if (verifyResult.orphaned_count > 0) {
           parts.push(`Orphaned entries: ${verifyResult.orphaned_count}`);
         }
@@ -3781,14 +3747,13 @@ function getBinaryPath(): string | null {
 }
 
 async function isServerRunning(): Promise<boolean> {
+  // Try root endpoint first (no auth required for Cloudflare Worker)
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2000);
-
-    const response = await fetch(`${API_URL}/health`, {
+    const response = await fetch(`${API_URL}/`, {
       signal: controller.signal,
     });
-
     clearTimeout(timeout);
     return response.ok;
   } catch {
