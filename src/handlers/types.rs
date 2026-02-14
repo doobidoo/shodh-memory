@@ -329,7 +329,7 @@ pub struct UpsertRequest {
 }
 
 fn default_change_type() -> String {
-    "update".to_string()
+    "content_updated".to_string()
 }
 
 #[derive(Serialize)]
@@ -447,6 +447,8 @@ pub struct ConsolidateResponse {
     pub memories_replayed: usize,
     pub edges_strengthened: usize,
     pub memories_decayed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 // =============================================================================
@@ -937,7 +939,7 @@ mod tests {
         });
         let req: UpsertRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.external_id, "linear:SHO-123");
-        assert_eq!(req.change_type, "update"); // default
+        assert_eq!(req.change_type, "content_updated"); // default
     }
 
     #[test]

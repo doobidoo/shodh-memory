@@ -14,12 +14,23 @@ const SHODH_USER_ID = process.env.SHODH_USER_ID || "claude-code";
 
 interface HookInput {
   hook_event_name: string;
+  session_id?: string;
+  transcript_path?: string;
+  cwd?: string;
+  // UserPromptSubmit
   prompt?: string;
+  // PreToolUse / PostToolUse
   tool_name?: string;
   tool_input?: Record<string, unknown>;
   tool_output?: string;
+  tool_response?: unknown;
+  // Stop
   stop_reason?: string;
-  session_id?: string;
+  // SubagentStop
+  agent_id?: string;
+  agent_type?: string;
+  agent_transcript_path?: string;
+  // Legacy field names (backward compat)
   subagent_type?: string;
   subagent_result?: string;
 }
@@ -28,14 +39,27 @@ interface SurfacedMemory {
   id: string;
   content: string;
   memory_type: string;
-  relevance_score: number;
+  score: number;
+  importance: number;
   created_at: string;
+  tags: string[];
+  relevance_reason: string;
+  matched_entities: string[];
 }
 
-interface ProactiveResponse {
+interface ProactiveContextResponse {
   memories: SurfacedMemory[];
-  detected_entities: { text: string; entity_type: string }[];
+  due_reminders: unknown[];
+  context_reminders: unknown[];
+  memory_count: number;
+  reminder_count: number;
+  ingested_memory_id: string | null;
+  feedback_processed: { memories_evaluated: number; reinforced: string[]; weakened: string[] } | null;
+  relevant_todos: { id: string; short_id: string; content: string; status: string; priority: string; project: string | null; due_date: string | null; relevance_reason: string }[];
+  todo_count: number;
+  relevant_facts: { id: string; fact: string; confidence: number; support_count: number; related_entities: string[] }[];
   latency_ms: number;
+  detected_entities: { name: string; entity_type: string }[];
 }
 
 async function callBrain(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
@@ -74,31 +98,57 @@ function formatMemoriesForContext(memories: SurfacedMemory[]): string {
   return memories
     .map((m) => {
       const time = formatRelativeTime(m.created_at);
-      const score = Math.round(m.relevance_score * 100);
+      const score = Math.round(m.score * 100);
       return `• [${score}%] (${time}) ${m.content.slice(0, 120)}${m.content.length > 120 ? "..." : ""}`;
     })
     .join("\n");
 }
 
-async function surfaceProactiveContext(context: string, maxResults = 3): Promise<string | null> {
-  const response = (await callBrain("/api/relevant", {
+async function surfaceProactiveContext(context: string, maxResults = 3, autoIngest = false): Promise<string | null> {
+  const response = (await callBrain("/api/proactive_context", {
     user_id: SHODH_USER_ID,
     context,
-    config: {
-      semantic_threshold: 0.6,
-      entity_match_weight: 0.3,
-      semantic_weight: 0.5,
-      recency_weight: 0.2,
-      max_results: maxResults,
-    },
-  })) as ProactiveResponse | null;
+    max_results: maxResults,
+    semantic_threshold: 0.6,
+    entity_match_weight: 0.3,
+    recency_weight: 0.2,
+    auto_ingest: autoIngest,
+  })) as ProactiveContextResponse | null;
 
-  if (!response?.memories?.length) return null;
+  if (!response) return null;
+
+  const hasMemories = response.memories?.length > 0;
+  const hasFacts = response.relevant_facts?.length > 0;
+  const hasTodos = response.relevant_todos?.length > 0;
+  const hasReminders = (response.due_reminders?.length || 0) + (response.context_reminders?.length || 0) > 0;
+
+  if (!hasMemories && !hasFacts && !hasTodos && !hasReminders) return null;
 
   const now = new Date();
   const header = `📅 ${now.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
 
-  return `${header}\n${formatMemoriesForContext(response.memories)}`;
+  let output = header;
+  if (hasMemories) {
+    output += `\n${formatMemoriesForContext(response.memories)}`;
+  }
+  if (hasFacts) {
+    output += `\n🧠 Facts:`;
+    for (const f of response.relevant_facts.slice(0, 3)) {
+      output += `\n• (${Math.round(f.confidence * 100)}%) ${f.fact}`;
+    }
+  }
+  if (hasTodos) {
+    output += `\n📋 Todos:`;
+    for (const t of response.relevant_todos.slice(0, 3)) {
+      const icon = t.status === "in_progress" ? "🔄" : "☐";
+      output += `\n${icon} ${t.content.slice(0, 80)}`;
+    }
+  }
+  if (hasReminders) {
+    const allReminders = [...(response.due_reminders || []), ...(response.context_reminders || [])];
+    output += `\n⏰ ${allReminders.length} reminder(s) active`;
+  }
+  return output;
 }
 
 async function handleSessionStart(): Promise<void> {
@@ -133,8 +183,8 @@ async function handleUserPrompt(input: HookInput): Promise<void> {
   const prompt = input.prompt;
   if (!prompt || prompt.length < 10) return;
 
-  // Surface proactive context for this prompt
-  const memoryContext = await surfaceProactiveContext(prompt.slice(0, 500), 3);
+  // Single call: surface memories AND ingest the prompt in one pipeline pass
+  const memoryContext = await surfaceProactiveContext(prompt.slice(0, 1000), 3, true);
 
   if (memoryContext) {
     console.log(
@@ -146,14 +196,6 @@ async function handleUserPrompt(input: HookInput): Promise<void> {
       })
     );
   }
-
-  // Ingest the prompt itself (brain sees what user is asking)
-  await callBrain("/api/proactive_context", {
-    user_id: SHODH_USER_ID,
-    context: prompt.slice(0, 1000),
-    auto_ingest: true,
-    max_results: 0, // Just ingest, don't need results
-  });
 }
 
 async function handlePreToolUse(input: HookInput): Promise<void> {
@@ -197,6 +239,12 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
   const toolOutput = input.tool_output;
 
   if (!toolName) return;
+
+  // Orchestration: handle Task tool completions
+  if (toolName === "Task") {
+    await handlePostToolUseTask(input);
+    return;
+  }
 
   // Store significant tool uses
   if (toolName === "Edit" || toolName === "Write") {
@@ -264,18 +312,174 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
   }
 }
 
-async function handleSubagentStop(input: HookInput): Promise<void> {
-  const subagentType = input.subagent_type;
-  const result = input.subagent_result;
+// --- Orchestration: PostToolUse(Task) handler ---
 
-  if (!subagentType || !result) return;
+const ORCH_TAG_RE = /\[ORCH-TODO:([A-Z]+-\d+)\]/;
 
-  // Store significant subagent results
+async function callBrainGet(endpoint: string): Promise<unknown> {
+  try {
+    const response = await fetch(`${SHODH_API_URL}${endpoint}`, {
+      headers: { "X-API-Key": SHODH_API_KEY },
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function unblockDependents(completedShortId: string): Promise<void> {
+  const dashIdx = completedShortId.lastIndexOf("-");
+  if (dashIdx < 0) return;
+
+  // List all projects to find the one matching this prefix
+  // API returns [project, stats] tuples in the projects array
+  const projectsResp = (await callBrain("/api/projects/list", {
+    user_id: SHODH_USER_ID,
+  })) as { projects?: Array<[{ id: string; name: string; prefix?: string }, unknown]> } | null;
+
+  if (!projectsResp?.projects?.length) return;
+
+  const prefix = completedShortId.substring(0, dashIdx).toUpperCase();
+  const projectEntry = projectsResp.projects.find(
+    (entry) => {
+      const p = Array.isArray(entry) ? entry[0] : entry;
+      return (p.prefix || "").toUpperCase() === prefix;
+    }
+  );
+  if (!projectEntry) return;
+  const project = Array.isArray(projectEntry) ? projectEntry[0] : projectEntry;
+
+  // List blocked todos in this project
+  const todosResp = (await callBrain("/api/todos/list", {
+    user_id: SHODH_USER_ID,
+    project: project.name,
+    status: ["blocked"],
+  })) as { todos?: Array<{ id: string; seq_num?: number; project_prefix?: string; blocked_on?: string }> } | null;
+
+  if (!todosResp?.todos?.length) return;
+
+  for (const todo of todosResp.todos) {
+    if (!todo.blocked_on) continue;
+
+    const blockers = todo.blocked_on.split(",").map((s) => s.trim());
+    const remaining = blockers.filter((b) => b !== completedShortId);
+    // Construct short_id from project_prefix + seq_num, fall back to UUID
+    const todoId = todo.project_prefix && todo.seq_num != null
+      ? `${todo.project_prefix}-${todo.seq_num}`
+      : todo.id;
+
+    if (remaining.length === 0) {
+      // All blockers resolved — unblock
+      await callBrain(`/api/todos/${todoId}/update`, {
+        user_id: SHODH_USER_ID,
+        status: "todo",
+        blocked_on: "",
+      });
+      await callBrain(`/api/todos/${todoId}/comments`, {
+        user_id: SHODH_USER_ID,
+        content: `Unblocked: dependency ${completedShortId} completed`,
+        comment_type: "activity",
+      });
+    } else {
+      // Some blockers remain — update the list
+      await callBrain(`/api/todos/${todoId}/update`, {
+        user_id: SHODH_USER_ID,
+        blocked_on: remaining.join(","),
+      });
+    }
+  }
+}
+
+async function handlePostToolUseTask(input: HookInput): Promise<void> {
+  const toolInput = input.tool_input;
+  const toolResult = input.tool_output ?? input.tool_response;
+
+  if (!toolInput) return;
+
+  const prompt = (toolInput.prompt as string) || "";
+  const resultText = typeof toolResult === "string"
+    ? toolResult
+    : toolResult != null
+      ? JSON.stringify(toolResult)
+      : "";
+
+  // Check for orchestration tag
+  const tagMatch = prompt.match(ORCH_TAG_RE);
+
+  if (!tagMatch) {
+    // Not an orchestration task — store as generic memory
+    if (resultText) {
+      await callBrain("/api/remember", {
+        user_id: SHODH_USER_ID,
+        content: `Task agent completed: ${resultText.slice(0, 300)}`,
+        memory_type: "Task",
+        tags: ["subagent:task", "source:hook"],
+      });
+    }
+    return;
+  }
+
+  const todoShortId = tagMatch[1];
+
+  // 1. Add Resolution comment with agent result
+  if (resultText) {
+    await callBrain(`/api/todos/${todoShortId}/comments`, {
+      user_id: SHODH_USER_ID,
+      content: resultText.slice(0, 4000),
+      comment_type: "resolution",
+    });
+  }
+
+  // 2. Complete the todo (path-based endpoint)
+  await callBrain(`/api/todos/${todoShortId}/complete`, {
+    user_id: SHODH_USER_ID,
+  });
+
+  // 3. Unblock dependents
+  await unblockDependents(todoShortId);
+
+  // 4. Store memory of orchestration completion
   await callBrain("/api/remember", {
     user_id: SHODH_USER_ID,
-    content: `${subagentType} agent completed: ${result.slice(0, 300)}`,
+    content: `Orchestration task ${todoShortId} completed: ${resultText.slice(0, 200)}`,
     memory_type: "Task",
-    tags: [`subagent:${subagentType}`, "source:hook"],
+    tags: ["orchestration", `todo:${todoShortId}`, "source:hook"],
+  });
+
+  // 5. Surface orchestration status
+  const memoryContext = await surfaceProactiveContext(
+    `Orchestration: task ${todoShortId} completed, checking for unblocked work`,
+    2
+  );
+  if (memoryContext) {
+    console.log(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PostToolUse",
+          additionalContext: `\n<shodh-memory context="orchestration">\n${memoryContext}\n</shodh-memory>`,
+        },
+      })
+    );
+  }
+}
+
+async function handleSubagentStop(input: HookInput): Promise<void> {
+  const agentType = input.agent_type || input.subagent_type;
+  const agentId = input.agent_id;
+  const result = input.subagent_result;
+
+  if (!agentType) return;
+
+  const content = result
+    ? `${agentType} agent completed: ${result.slice(0, 300)}`
+    : `${agentType} agent (${agentId || "unknown"}) completed`;
+
+  await callBrain("/api/remember", {
+    user_id: SHODH_USER_ID,
+    content,
+    memory_type: "Task",
+    tags: [`subagent:${agentType}`, "source:hook"],
   });
 }
 
@@ -323,4 +527,8 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(console.error);
+try {
+  await main();
+} catch {
+  // Silent — hooks must not crash Claude Code
+}

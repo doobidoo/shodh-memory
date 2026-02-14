@@ -202,10 +202,17 @@ struct LazyNerModel {
 
 impl LazyNerModel {
     fn new(config: &NerConfig) -> Result<Self> {
+        // macOS ARM64: default to 1 thread to avoid Eigen thread pool
+        // spin-to-block deadlock on heterogeneous P/E cores.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let default_threads = 1;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let default_threads = 2;
+
         let num_threads = std::env::var("SHODH_ONNX_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or(default_threads);
 
         tracing::info!(
             "Loading BERT-NER model from {:?} with {} threads",
@@ -213,10 +220,23 @@ impl LazyNerModel {
             num_threads
         );
 
-        let session = Session::builder()
+        let builder = Session::builder()
             .context("Failed to create NER session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set NER thread count")?
+            .context("Failed to set NER intra thread count")?
+            .with_inter_threads(1)
+            .context("Failed to set NER inter thread count")?;
+
+        // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
+        // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
+        // See: microsoft/onnxruntime#10270, pykeio/ort#516
+        let builder = builder
+            .with_intra_op_spinning(false)
+            .context("Failed to disable NER intra-op spinning")?
+            .with_inter_op_spinning(false)
+            .context("Failed to disable NER inter-op spinning")?;
+
+        let session = builder
             .commit_from_file(&config.model_path)
             .context("Failed to load NER ONNX model")?;
 
@@ -484,7 +504,7 @@ impl NeuralNer {
         }
 
         // Create ONNX input tensors
-        let input_ids_value = Value::from_array((vec![batch_size, max_length], input_ids.clone()))
+        let input_ids_value = Value::from_array((vec![batch_size, max_length], input_ids))
             .context("Failed to create batched input_ids tensor")?;
         let attention_mask_value =
             Value::from_array((vec![batch_size, max_length], attention_mask.clone()))
@@ -494,7 +514,17 @@ impl NeuralNer {
                 .context("Failed to create batched token_type_ids tensor")?;
 
         // Run batch inference
-        let mut session = model.session.lock();
+        let mut session = match model
+            .session
+            .try_lock_for(std::time::Duration::from_secs(30))
+        {
+            Some(guard) => guard,
+            None => {
+                tracing::warn!("NER batch session lock timeout after 30s, returning empty results");
+                crate::metrics::NER_LOCK_TIMEOUT_TOTAL.inc();
+                return Ok(vec![Vec::new(); texts.len()]);
+            }
+        };
         let outputs = session
             .run(ort::inputs![
                 "input_ids" => &input_ids_value,
@@ -533,14 +563,9 @@ impl NeuralNer {
 
                 let start_idx = batch_offset + i * num_labels;
                 let token_logits = &logits[start_idx..start_idx + num_labels];
-                let probs = softmax(token_logits);
 
-                // Find highest probability label (safe: partial_cmp handles NaN, empty probs skipped)
-                let Some((best_idx, best_prob)) = probs
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                else {
+                // Find highest probability label without allocating a Vec
+                let Some((best_idx, best_prob)) = argmax_softmax(token_logits) else {
                     continue; // Empty probs (shouldn't happen, but defensive)
                 };
 
@@ -548,25 +573,29 @@ impl NeuralNer {
 
                 match (&current_entity, tag.is_begin(), tag.is_inside()) {
                     (None, true, _) => {
-                        current_entity = Some((tag, vec![i], *best_prob));
+                        current_entity = Some((tag, vec![i], best_prob));
                     }
-                    (Some((prev_tag, indices, acc_prob)), _, true)
+                    (Some((prev_tag, _indices, _acc_prob)), _, true)
                         if tag.matches_type(prev_tag) =>
                     {
-                        let mut new_indices = indices.clone();
-                        new_indices.push(i);
-                        current_entity = Some((*prev_tag, new_indices, acc_prob + best_prob));
+                        // Take ownership to extend indices in-place (avoids clone)
+                        if let Some((prev_tag, mut indices, acc_prob)) = current_entity.take() {
+                            indices.push(i);
+                            current_entity = Some((prev_tag, indices, acc_prob + best_prob));
+                        }
                     }
-                    (Some((prev_tag, indices, acc_prob)), _, _) => {
-                        if let Some(entity) =
-                            self.build_entity(text, prev_tag, indices, *acc_prob, offsets)
-                        {
-                            if entity.confidence >= self.config.confidence_threshold {
-                                entities.push(entity);
+                    (Some((_prev_tag, _indices, _acc_prob)), _, _) => {
+                        if let Some((prev_tag, indices, acc_prob)) = current_entity.take() {
+                            if let Some(entity) =
+                                self.build_entity(text, &prev_tag, &indices, acc_prob, offsets)
+                            {
+                                if entity.confidence >= self.config.confidence_threshold {
+                                    entities.push(entity);
+                                }
                             }
                         }
                         if tag.is_begin() {
-                            current_entity = Some((tag, vec![i], *best_prob));
+                            current_entity = Some((tag, vec![i], best_prob));
                         } else {
                             current_entity = None;
                         }
@@ -603,7 +632,17 @@ impl NeuralNer {
     /// Neural extraction using ONNX model
     fn extract_neural(&self, text: &str) -> Result<Vec<NerEntity>> {
         let model = self.ensure_model_loaded()?;
-        let mut session = model.session.lock();
+        let mut session = match model
+            .session
+            .try_lock_for(std::time::Duration::from_secs(30))
+        {
+            Some(guard) => guard,
+            None => {
+                tracing::warn!("NER session lock timeout after 30s, returning empty");
+                crate::metrics::NER_LOCK_TIMEOUT_TOTAL.inc();
+                return Ok(Vec::new());
+            }
+        };
 
         // Tokenize input
         let encoding = model
@@ -671,15 +710,8 @@ impl NeuralNer {
             let start_idx = i * num_labels;
             let token_logits = &logits[start_idx..start_idx + num_labels];
 
-            // Softmax to get probabilities
-            let probs = softmax(token_logits);
-
-            // Find best label (safe: partial_cmp handles NaN, empty probs skipped)
-            let Some((best_idx, best_prob)) = probs
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            else {
+            // Find best label without allocating a Vec
+            let Some((best_idx, best_prob)) = argmax_softmax(token_logits) else {
                 continue; // Empty probs (shouldn't happen, but defensive)
             };
 
@@ -689,28 +721,32 @@ impl NeuralNer {
             match (&current_entity, tag.is_begin(), tag.is_inside()) {
                 // Begin new entity
                 (None, true, _) => {
-                    current_entity = Some((tag, vec![i], *best_prob));
+                    current_entity = Some((tag, vec![i], best_prob));
                 }
                 // Continue current entity
-                (Some((prev_tag, indices, acc_prob)), _, true) if tag.matches_type(prev_tag) => {
-                    let mut new_indices = indices.clone();
-                    new_indices.push(i);
-                    current_entity = Some((*prev_tag, new_indices, acc_prob + best_prob));
+                (Some((prev_tag, _indices, _acc_prob)), _, true) if tag.matches_type(prev_tag) => {
+                    // Take ownership to extend indices in-place (avoids clone)
+                    if let Some((prev_tag, mut indices, acc_prob)) = current_entity.take() {
+                        indices.push(i);
+                        current_entity = Some((prev_tag, indices, acc_prob + best_prob));
+                    }
                 }
                 // End current entity, possibly start new
-                (Some((prev_tag, indices, acc_prob)), _, _) => {
+                (Some((_prev_tag, _indices, _acc_prob)), _, _) => {
                     // Save previous entity
-                    if let Some(entity) =
-                        self.build_entity(text, prev_tag, indices, *acc_prob, offsets)
-                    {
-                        if entity.confidence >= self.config.confidence_threshold {
-                            entities.push(entity);
+                    if let Some((prev_tag, indices, acc_prob)) = current_entity.take() {
+                        if let Some(entity) =
+                            self.build_entity(text, &prev_tag, &indices, acc_prob, offsets)
+                        {
+                            if entity.confidence >= self.config.confidence_threshold {
+                                entities.push(entity);
+                            }
                         }
                     }
 
                     // Start new entity if this is a B- tag
                     if tag.is_begin() {
-                        current_entity = Some((tag, vec![i], *best_prob));
+                        current_entity = Some((tag, vec![i], best_prob));
                     } else {
                         current_entity = None;
                     }
@@ -852,11 +888,16 @@ impl NeuralNer {
                 // EntityExtractor returns salience 0.6-0.9, map to confidence 0.5-0.85
                 let confidence = (e.base_salience * 0.9).min(0.85);
 
-                // Find position in original text (case-insensitive search)
+                // Find position in original text (case-insensitive byte-offset search)
+                let name_lower = e.name.to_lowercase();
                 let (start, end) = text
-                    .to_lowercase()
-                    .find(&e.name.to_lowercase())
-                    .map(|pos| (pos, pos + e.name.len()))
+                    .char_indices()
+                    .find(|&(i, _)| {
+                        text[i..]
+                            .get(..e.name.len())
+                            .is_some_and(|slice| slice.eq_ignore_ascii_case(&name_lower))
+                    })
+                    .map(|(pos, _)| (pos, pos + e.name.len()))
                     .unwrap_or((0, e.name.len()));
 
                 NerEntity {
@@ -873,14 +914,18 @@ impl NeuralNer {
     }
 }
 
-/// Softmax function for converting logits to probabilities
-fn softmax(logits: &[f32]) -> Vec<f32> {
+/// Return (argmax_index, softmax_probability) without allocating a Vec.
+pub fn argmax_softmax(logits: &[f32]) -> Option<(usize, f32)> {
+    if logits.is_empty() {
+        return None;
+    }
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp_sum: f32 = logits.iter().map(|x| (x - max_logit).exp()).sum();
     logits
         .iter()
-        .map(|x| (x - max_logit).exp() / exp_sum)
-        .collect()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, &val)| (idx, (val - max_logit).exp() / exp_sum))
 }
 
 #[cfg(test)]
@@ -974,6 +1019,16 @@ mod tests {
     }
 
     // ==================== Softmax Tests ====================
+
+    /// Test-only softmax (the production code uses argmax_softmax to avoid allocation).
+    fn softmax(logits: &[f32]) -> Vec<f32> {
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_sum: f32 = logits.iter().map(|x| (x - max_logit).exp()).sum();
+        logits
+            .iter()
+            .map(|x| (x - max_logit).exp() / exp_sum)
+            .collect()
+    }
 
     #[test]
     fn test_softmax_basic() {

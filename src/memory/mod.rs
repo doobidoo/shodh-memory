@@ -48,9 +48,9 @@ use crate::metrics::{
 
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
-    DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, ESTIMATED_BYTES_PER_MEMORY,
-    HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING, POTENTIATION_ACCESS_THRESHOLD,
-    POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
+    DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, EDGE_SEMANTIC_WEIGHT_FLOOR,
+    ESTIMATED_BYTES_PER_MEMORY, HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING,
+    POTENTIATION_ACCESS_THRESHOLD, POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
     TIER_PROMOTION_SESSION_IMPORTANCE, TIER_PROMOTION_WORKING_AGE_SECS,
     TIER_PROMOTION_WORKING_IMPORTANCE,
 };
@@ -235,6 +235,36 @@ pub struct MemorySystem {
     /// Extracts and indexes facts like "Melanie is planning camping next month"
     /// Resolves relative dates ("next month" → June 2023) for accurate retrieval
     temporal_fact_store: Arc<temporal_facts::TemporalFactStore>,
+}
+
+/// Resolve an entity name to a graph label and salience using pre-extracted NER data.
+///
+/// Returns (EntityLabel, salience) based on NER type mapping, defaulting to (Concept, 0.5).
+fn resolve_entity_label(
+    entity_name: &str,
+    ner_lookup: &std::collections::HashMap<String, (String, f32)>,
+) -> (crate::graph_memory::EntityLabel, f32) {
+    if let Some((ner_type, confidence)) = ner_lookup.get(&entity_name.to_lowercase()) {
+        let label = match ner_type.as_str() {
+            "PER" => crate::graph_memory::EntityLabel::Person,
+            "ORG" => crate::graph_memory::EntityLabel::Organization,
+            "LOC" => crate::graph_memory::EntityLabel::Location,
+            _ => crate::graph_memory::EntityLabel::Concept,
+        };
+        (label, *confidence)
+    } else {
+        (crate::graph_memory::EntityLabel::Concept, 0.5)
+    }
+}
+
+/// Build a lookup table from NER entity records for label resolution.
+fn build_ner_lookup(
+    ner_entities: &[NerEntityRecord],
+) -> std::collections::HashMap<String, (String, f32)> {
+    ner_entities
+        .iter()
+        .map(|r| (r.text.to_lowercase(), (r.entity_type.clone(), r.confidence)))
+        .collect()
 }
 
 impl MemorySystem {
@@ -430,6 +460,25 @@ impl MemorySystem {
         // Uses the same DB with "temporal_facts:", "temporal_by_entity:", "temporal_by_event:" prefixes
         let temporal_fact_store = Arc::new(temporal_facts::TemporalFactStore::new(storage.db()));
 
+        // SHO-106: Load persisted interference history from RocksDB
+        let interference_detector = {
+            let mut detector = replay::InterferenceDetector::new();
+            match storage.load_all_interference_records() {
+                Ok((history, total_events)) => {
+                    if !history.is_empty() {
+                        detector.load_history(history, total_events);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load interference history, starting fresh"
+                    );
+                }
+            }
+            Arc::new(RwLock::new(detector))
+        };
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -449,8 +498,8 @@ impl MemorySystem {
             consolidation_events, // Use the shared buffer created earlier
             // SHO-105: Memory replay manager
             replay_manager: Arc::new(RwLock::new(replay::ReplayManager::new())),
-            // SHO-106: Interference detector
-            interference_detector: Arc::new(RwLock::new(replay::InterferenceDetector::new())),
+            // SHO-106: Interference detector (loaded from RocksDB)
+            interference_detector,
             // PIPE-2: Pattern detector for intelligent replay triggers
             pattern_detector: Arc::new(RwLock::new(pattern_detection::PatternDetector::new())),
             // SHO-f0e7: Semantic fact store
@@ -606,36 +655,39 @@ impl MemorySystem {
             // Phase 1: Build entity structs with proper labels from NER (CPU work, no lock needed)
             // Uses pre-extracted NER records for accurate labels (Person, Organization, Location)
             // instead of defaulting everything to Concept
-            let ner_lookup: std::collections::HashMap<String, (&str, f32)> = memory
+            let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
+
+            // Batch-encode entity names for concept-level dedup in graph.
+            // This populates name_embedding on each EntityNode, enabling
+            // graph_memory::add_entity() to merge synonyms via cosine similarity.
+            let entity_names: Vec<&str> = memory
                 .experience
-                .ner_entities
+                .entities
                 .iter()
-                .map(|r| {
-                    (
-                        r.text.to_lowercase(),
-                        (r.entity_type.as_str(), r.confidence),
-                    )
-                })
+                .map(|s| s.as_str())
                 .collect();
+            let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
+                Vec::new()
+            } else {
+                match self.embedder.encode_batch(&entity_names) {
+                    Ok(embs) => embs.into_iter().map(Some).collect(),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Entity name embedding failed, concept merge disabled for this batch"
+                        );
+                        vec![None; entity_names.len()]
+                    }
+                }
+            };
 
             let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
                 .experience
                 .entities
                 .iter()
-                .map(|entity_name| {
-                    let (label, salience) = if let Some((ner_type, confidence)) =
-                        ner_lookup.get(&entity_name.to_lowercase())
-                    {
-                        let label = match *ner_type {
-                            "PER" => crate::graph_memory::EntityLabel::Person,
-                            "ORG" => crate::graph_memory::EntityLabel::Organization,
-                            "LOC" => crate::graph_memory::EntityLabel::Location,
-                            _ => crate::graph_memory::EntityLabel::Concept,
-                        };
-                        (label, *confidence)
-                    } else {
-                        (crate::graph_memory::EntityLabel::Concept, 0.5)
-                    };
+                .zip(entity_embeddings.into_iter())
+                .map(|(entity_name, embedding)| {
+                    let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
                     crate::graph_memory::EntityNode {
                         uuid: Uuid::new_v4(),
                         name: entity_name.clone(),
@@ -645,7 +697,7 @@ impl MemorySystem {
                         mention_count: 1,
                         summary: String::new(),
                         attributes: std::collections::HashMap::new(),
-                        name_embedding: None,
+                        name_embedding: embedding,
                         salience,
                         is_proper_noun: entity_name
                             .chars()
@@ -679,7 +731,11 @@ impl MemorySystem {
                 }
             }
 
-            // Insert all relationships
+            // Insert all relationships with semantic edge weighting.
+            // Initial edge strength is modulated by the cosine similarity between
+            // the two entities' name embeddings: related pairs get full L1 weight,
+            // unrelated co-occurrences get a fraction (decays to zero faster).
+            let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
             for (entity1, entity2) in cooccurrence_pairs {
                 if let (Ok(Some(e1)), Ok(Some(e2))) = (
                     graph_guard.find_entity_by_name(&entity1),
@@ -687,12 +743,22 @@ impl MemorySystem {
                 ) {
                     let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
 
+                    // Semantic edge weighting: scale initial strength by entity relatedness
+                    let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
+                        (Some(emb1), Some(emb2)) => {
+                            let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
+                            EDGE_SEMANTIC_WEIGHT_FLOOR + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
+                        }
+                        // No embeddings available → full weight (legacy behavior)
+                        _ => 1.0,
+                    };
+
                     let edge = crate::graph_memory::RelationshipEdge {
                         uuid: Uuid::new_v4(),
                         from_entity: e1.uuid,
                         to_entity: e2.uuid,
                         relation_type: crate::graph_memory::RelationType::CoOccurs,
-                        strength: crate::graph_memory::EdgeTier::L1Working.initial_weight(),
+                        strength: l1_base_weight * semantic_weight,
                         created_at: now,
                         valid_at: now,
                         invalidated_at: None,
@@ -862,8 +928,8 @@ impl MemorySystem {
                         }
 
                         // Record interference events
-                        for event in interference_result.events {
-                            self.record_consolidation_event(event);
+                        for event in &interference_result.events {
+                            self.record_consolidation_event(event.clone());
                         }
 
                         // Handle duplicates - don't duplicate here, just log
@@ -872,6 +938,29 @@ impl MemorySystem {
                                 memory_id = %memory.id.0,
                                 "Memory detected as near-duplicate of existing memory"
                             );
+                        }
+
+                        // Persist affected interference records to RocksDB
+                        {
+                            let detector = self.interference_detector.read();
+                            let affected_ids = detector.get_affected_ids_from_check(
+                                &memory.id.0.to_string(),
+                                &interference_result,
+                            );
+                            for (id, records) in detector.get_records_for_ids(&affected_ids) {
+                                if let Err(e) =
+                                    self.long_term_memory.save_interference_records(id, records)
+                                {
+                                    tracing::debug!("Failed to persist interference records: {e}");
+                                }
+                            }
+                            let (total_events, _) = detector.stats();
+                            if let Err(e) = self
+                                .long_term_memory
+                                .save_interference_event_count(total_events)
+                            {
+                                tracing::debug!("Failed to persist interference event count: {e}");
+                            }
                         }
                     }
                 }
@@ -991,36 +1080,37 @@ impl MemorySystem {
             let now = chrono::Utc::now();
 
             // Phase 1: Build entity structs with proper labels from NER
-            let ner_lookup: std::collections::HashMap<String, (&str, f32)> = memory
+            let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
+
+            // Batch-encode entity names for concept-level dedup
+            let entity_names: Vec<&str> = memory
                 .experience
-                .ner_entities
+                .entities
                 .iter()
-                .map(|r| {
-                    (
-                        r.text.to_lowercase(),
-                        (r.entity_type.as_str(), r.confidence),
-                    )
-                })
+                .map(|s| s.as_str())
                 .collect();
+            let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
+                Vec::new()
+            } else {
+                match self.embedder.encode_batch(&entity_names) {
+                    Ok(embs) => embs.into_iter().map(Some).collect(),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Entity name embedding failed, concept merge disabled for this batch"
+                        );
+                        vec![None; entity_names.len()]
+                    }
+                }
+            };
 
             let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
                 .experience
                 .entities
                 .iter()
-                .map(|entity_name| {
-                    let (label, salience) = if let Some((ner_type, confidence)) =
-                        ner_lookup.get(&entity_name.to_lowercase())
-                    {
-                        let label = match *ner_type {
-                            "PER" => crate::graph_memory::EntityLabel::Person,
-                            "ORG" => crate::graph_memory::EntityLabel::Organization,
-                            "LOC" => crate::graph_memory::EntityLabel::Location,
-                            _ => crate::graph_memory::EntityLabel::Concept,
-                        };
-                        (label, *confidence)
-                    } else {
-                        (crate::graph_memory::EntityLabel::Concept, 0.5)
-                    };
+                .zip(entity_embeddings.into_iter())
+                .map(|(entity_name, embedding)| {
+                    let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
                     crate::graph_memory::EntityNode {
                         uuid: Uuid::new_v4(),
                         name: entity_name.clone(),
@@ -1030,7 +1120,7 @@ impl MemorySystem {
                         mention_count: 1,
                         summary: String::new(),
                         attributes: std::collections::HashMap::new(),
-                        name_embedding: None,
+                        name_embedding: embedding,
                         salience,
                         is_proper_noun: entity_name
                             .chars()
@@ -1060,6 +1150,8 @@ impl MemorySystem {
                 }
             }
 
+            // Semantic edge weighting
+            let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
             for (entity1, entity2) in cooccurrence_pairs {
                 if let (Ok(Some(e1)), Ok(Some(e2))) = (
                     graph_guard.find_entity_by_name(&entity1),
@@ -1067,12 +1159,20 @@ impl MemorySystem {
                 ) {
                     let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
 
+                    let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
+                        (Some(emb1), Some(emb2)) => {
+                            let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
+                            EDGE_SEMANTIC_WEIGHT_FLOOR + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
+                        }
+                        _ => 1.0,
+                    };
+
                     let edge = crate::graph_memory::RelationshipEdge {
                         uuid: Uuid::new_v4(),
                         from_entity: e1.uuid,
                         to_entity: e2.uuid,
                         relation_type: crate::graph_memory::RelationType::CoOccurs,
-                        strength: crate::graph_memory::EdgeTier::L1Working.initial_weight(),
+                        strength: l1_base_weight * semantic_weight,
                         created_at: now,
                         valid_at: now,
                         invalidated_at: None,
@@ -1641,6 +1741,28 @@ impl MemorySystem {
 
                 let mut ids = Vec::new();
 
+                // Density-adaptive traversal: dense graphs get shallower depth
+                // and stricter strength filters to avoid exploring noisy L1 edges.
+                // Dense graph results are already downweighted in RRF fusion
+                // (graph_w=0.1 at density>2.0), so deep traversals add I/O cost
+                // for results that contribute <0.01% to the fused score.
+                let density_val = d.unwrap_or(0.0);
+                let (bidir_depth, bidir_min_str, weighted_depth, weighted_min_str) =
+                    if density_val > 15.0 {
+                        (3usize, 0.12f32, 3usize, 0.15f32)
+                    } else if density_val > 8.0 {
+                        (4, 0.08, 4, 0.12)
+                    } else {
+                        (6, 0.05, 5, 0.10)
+                    };
+
+                if density_val > 0.0 {
+                    tracing::debug!(
+                        "Layer 2: density={:.1}, bidir_depth={}, bidir_min_str={:.2}, weighted_depth={}, weighted_min_str={:.2}",
+                        density_val, bidir_depth, bidir_min_str, weighted_depth, weighted_min_str
+                    );
+                }
+
                 // Multi-hop: Use bidirectional search between entity pairs
                 if query_entities.len() >= 2 {
                     // Find paths between all pairs of query entities
@@ -1649,8 +1771,8 @@ impl MemorySystem {
                             if let Ok(path) = g.traverse_bidirectional(
                                 &query_entities[i],
                                 &query_entities[j],
-                                6,    // max_depth for bidirectional
-                                0.05, // lower min_strength for multi-hop
+                                bidir_depth,
+                                bidir_min_str,
                             ) {
                                 // Path entities are highly relevant for multi-hop
                                 for tr in &path.entities {
@@ -1681,7 +1803,9 @@ impl MemorySystem {
 
                 // Single-hop or supplement multi-hop: Weighted traversal from each entity
                 for entity_uuid in &query_entities {
-                    if let Ok(t) = g.traverse_weighted(entity_uuid, 5, None, 0.1) {
+                    if let Ok(t) =
+                        g.traverse_weighted(entity_uuid, weighted_depth, None, weighted_min_str)
+                    {
                         for tr in &t.entities {
                             if let Ok(eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
                                 for ep in eps {
@@ -2253,8 +2377,8 @@ impl MemorySystem {
                 .apply_retrieval_competition(&candidates, query_text);
 
             // Record competition event if any memories were suppressed
-            if let Some(event) = competition_result.event {
-                self.record_consolidation_event(event);
+            if let Some(ref event) = competition_result.event {
+                self.record_consolidation_event(event.clone());
             }
 
             // Re-order memories based on competition results (winners first)
@@ -2272,6 +2396,27 @@ impl MemorySystem {
                     "Retrieval competition: {} memories suppressed",
                     competition_result.suppressed.len()
                 );
+            }
+
+            // Persist interference records from retrieval competition
+            {
+                let detector = self.interference_detector.read();
+                let affected_ids = detector.get_affected_ids_from_competition(&competition_result);
+                if !affected_ids.is_empty() {
+                    for (id, records) in detector.get_records_for_ids(&affected_ids) {
+                        if let Err(e) = self.long_term_memory.save_interference_records(id, records)
+                        {
+                            tracing::debug!("Failed to persist competition interference: {e}");
+                        }
+                    }
+                    let (total_events, _) = detector.stats();
+                    if let Err(e) = self
+                        .long_term_memory
+                        .save_interference_event_count(total_events)
+                    {
+                        tracing::debug!("Failed to persist interference event count: {e}");
+                    }
+                }
             }
         }
 
@@ -2549,6 +2694,18 @@ impl MemorySystem {
                     }
                 }
 
+                // Clean up BM25 keyword index
+                if let Err(e) = self.hybrid_search.remove_memory(&memory_id) {
+                    tracing::warn!(
+                        memory_id = %memory_id.0,
+                        error = %e,
+                        "Failed to clean BM25 index for deleted memory"
+                    );
+                }
+
+                // Clean up interference records
+                self.cleanup_interference_for_ids(&[memory_id.clone()]);
+
                 // Update stats - decrement each tier count that had this memory
                 if deleted_from_any {
                     let mut stats = self.stats.write();
@@ -2581,7 +2738,16 @@ impl MemorySystem {
                 let session_removed = self.session_memory.write().remove_older_than(cutoff)?;
 
                 // Mark as forgotten in long-term (don't delete, just flag)
-                let lt_flagged = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
+                let flagged_ids = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
+                let lt_flagged = flagged_ids.len();
+
+                // Clean up secondary indices for soft-forgotten memories
+                for id in &flagged_ids {
+                    self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
+                }
+                self.cleanup_graph_for_ids(&flagged_ids);
+                self.cleanup_interference_for_ids(&flagged_ids);
 
                 // Update stats for hard-deleted and soft-deleted tiers
                 {
@@ -2609,9 +2775,18 @@ impl MemorySystem {
                     .session_memory
                     .write()
                     .remove_below_importance(threshold)?;
-                let lt_flagged = self
+                let flagged_ids = self
                     .long_term_memory
                     .mark_forgotten_by_importance(threshold)?;
+                let lt_flagged = flagged_ids.len();
+
+                // Clean up secondary indices for soft-forgotten memories
+                for id in &flagged_ids {
+                    self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
+                }
+                self.cleanup_graph_for_ids(&flagged_ids);
+                self.cleanup_interference_for_ids(&flagged_ids);
 
                 // Update stats for hard-deleted and soft-deleted tiers
                 {
@@ -2651,6 +2826,13 @@ impl MemorySystem {
                 self.forget_all()?
             }
         };
+
+        // Commit BM25 changes after any deletion to make removals visible
+        if forgotten_count > 0 {
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!(error = %e, "Failed to commit BM25 after forget");
+            }
+        }
 
         Ok(forgotten_count)
     }
@@ -3323,6 +3505,24 @@ impl MemorySystem {
         }
     }
 
+    /// Clean up interference records for a batch of deleted memory IDs (best-effort)
+    fn cleanup_interference_for_ids(&self, ids: &[MemoryId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut detector = self.interference_detector.write();
+        for id in ids {
+            let id_str = id.0.to_string();
+            detector.clear_memory(&id_str);
+            if let Err(e) = self.long_term_memory.delete_interference_records(&id_str) {
+                tracing::debug!(
+                    "Interference cleanup failed for {}: {e}",
+                    &id_str[..8.min(id_str.len())]
+                );
+            }
+        }
+    }
+
     /// Forget memories matching a pattern
     ///
     /// Uses validated regex compilation with ReDoS protection
@@ -3345,12 +3545,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from working memory and vector index
+        // Remove from working memory and vector/BM25 index
         {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3367,12 +3568,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from session memory and vector index
+        // Remove from session memory and vector/BM25 index
         {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3386,19 +3588,21 @@ impl MemorySystem {
             if regex.is_match(&memory.experience.content) {
                 lt_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
+                let _ = self.hybrid_search.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
                 long_term_removed += 1;
                 count += 1;
             }
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         let all_ids: Vec<MemoryId> = working_ids
             .into_iter()
             .chain(session_ids)
             .chain(lt_ids)
             .collect();
         self.cleanup_graph_for_ids(&all_ids);
+        self.cleanup_interference_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3435,6 +3639,7 @@ impl MemorySystem {
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3454,6 +3659,7 @@ impl MemorySystem {
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3467,14 +3673,16 @@ impl MemorySystem {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
                 all_deleted_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
+                let _ = self.hybrid_search.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
                 long_term_removed += 1;
                 count += 1;
             }
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         self.cleanup_graph_for_ids(&all_deleted_ids);
+        self.cleanup_interference_for_ids(&all_deleted_ids);
 
         // Update stats
         {
@@ -3512,12 +3720,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from working memory and vector index
+        // Remove from working memory and vector/BM25 index
         {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3534,12 +3743,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from session memory and vector index
+        // Remove from session memory and vector/BM25 index
         {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3554,18 +3764,20 @@ impl MemorySystem {
         for memory in memories {
             lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
+            let _ = self.hybrid_search.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
             long_term_removed += 1;
             count += 1;
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         let all_ids: Vec<MemoryId> = working_ids
             .into_iter()
             .chain(session_ids)
             .chain(lt_ids)
             .collect();
         self.cleanup_graph_for_ids(&all_ids);
+        self.cleanup_interference_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3599,12 +3811,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from working memory and vector index
+        // Remove from working memory and vector/BM25 index
         {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3621,12 +3834,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from session memory and vector index
+        // Remove from session memory and vector/BM25 index
         {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3641,18 +3855,20 @@ impl MemorySystem {
         for memory in memories {
             lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
+            let _ = self.hybrid_search.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
             long_term_removed += 1;
             count += 1;
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         let all_ids: Vec<MemoryId> = working_ids
             .into_iter()
             .chain(session_ids)
             .chain(lt_ids)
             .collect();
         self.cleanup_graph_for_ids(&all_ids);
+        self.cleanup_interference_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3674,56 +3890,15 @@ impl MemorySystem {
     /// WARNING: This is a destructive operation. All memories across all tiers
     /// will be permanently deleted. This cannot be undone.
     fn forget_all(&self) -> Result<usize> {
+        // Deletion order: graph → long-term → session → working → stats
+        // This is fail-safe: if we crash mid-way, the most durable data
+        // (graph/long-term) is already deleted. Working/session memory is
+        // ephemeral and will be empty on restart anyway.
+
         let mut count = 0;
 
-        // Collect all IDs from working memory and clear
-        let working_ids: Vec<MemoryId> = {
-            let working = self.working_memory.read();
-            working
-                .all_memories()
-                .iter()
-                .map(|m| m.id.clone())
-                .collect()
-        };
-        let working_count = working_ids.len();
-        for id in &working_ids {
-            self.retriever.remove_memory(id);
-        }
-        {
-            let mut working = self.working_memory.write();
-            working.clear();
-        }
-        count += working_count;
-
-        // Collect all IDs from session memory and clear
-        let session_ids: Vec<MemoryId> = {
-            let session = self.session_memory.read();
-            session
-                .all_memories()
-                .iter()
-                .map(|m| m.id.clone())
-                .collect()
-        };
-        let session_count = session_ids.len();
-        for id in &session_ids {
-            self.retriever.remove_memory(id);
-        }
-        {
-            let mut session = self.session_memory.write();
-            session.clear();
-        }
-        count += session_count;
-
-        // Clear all from long-term memory (hard delete)
-        let all_lt = self.long_term_memory.get_all()?;
-        let long_term_count = all_lt.len();
-        for memory in all_lt {
-            self.retriever.remove_memory(&memory.id);
-            self.long_term_memory.delete(&memory.id)?;
-        }
-        count += long_term_count;
-
-        // Clear entire knowledge graph (GDPR - complete erasure)
+        // Step 1: Clear knowledge graph first (GDPR - complete erasure)
+        // Graph references memories, so clean references before deleting memories
         if let Some(graph) = &self.graph_memory {
             match graph.read().clear_all() {
                 Ok((entities, relationships, episodes)) => {
@@ -3736,11 +3911,119 @@ impl MemorySystem {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to clear knowledge graph during forget_all");
+                    // Continue — graph cleanup is best-effort for GDPR
                 }
             }
         }
 
-        // Reset all stats to zero
+        // Step 2: Clear long-term memory (persistent, most important to delete)
+        let all_lt = self.long_term_memory.get_all()?;
+        let long_term_count = all_lt.len();
+        for memory in all_lt {
+            self.retriever.remove_memory(&memory.id);
+            let _ = self.hybrid_search.remove_memory(&memory.id);
+            self.long_term_memory.delete(&memory.id)?;
+        }
+        count += long_term_count;
+
+        // Step 3: Clear session memory (ephemeral — lost on restart anyway)
+        let session_ids: Vec<MemoryId> = {
+            let session = self.session_memory.read();
+            session
+                .all_memories()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect()
+        };
+        let session_count = session_ids.len();
+        for id in &session_ids {
+            self.retriever.remove_memory(id);
+            let _ = self.hybrid_search.remove_memory(id);
+        }
+        {
+            let mut session = self.session_memory.write();
+            session.clear();
+        }
+        count += session_count;
+
+        // Step 4: Clear working memory (ephemeral — lost on restart anyway)
+        let working_ids: Vec<MemoryId> = {
+            let working = self.working_memory.read();
+            working
+                .all_memories()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect()
+        };
+        let working_count = working_ids.len();
+        for id in &working_ids {
+            self.retriever.remove_memory(id);
+            let _ = self.hybrid_search.remove_memory(id);
+        }
+        {
+            let mut working = self.working_memory.write();
+            working.clear();
+        }
+        count += working_count;
+
+        // Step 5: Commit BM25 deletions
+        if let Err(e) = self.hybrid_search.commit_and_reload() {
+            tracing::warn!(error = %e, "BM25 commit failed during forget_all");
+        }
+
+        // Step 6: Clear semantic facts (GDPR — knowledge derived from memories)
+        {
+            let db = self.long_term_memory.db();
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut facts_deleted = 0usize;
+            for prefix in &[
+                "facts:",
+                "facts_by_entity:",
+                "facts_by_type:",
+                "facts_embedding:",
+            ] {
+                let iter = db.prefix_iterator(prefix.as_bytes());
+                for item in iter {
+                    if let Ok((key, _)) = item {
+                        if !key.starts_with(prefix.as_bytes()) {
+                            break;
+                        }
+                        batch.delete(&key);
+                        if *prefix == "facts:" {
+                            facts_deleted += 1;
+                        }
+                    }
+                }
+            }
+            // Clear temporal facts
+            let iter = db.prefix_iterator(b"temporal_facts:");
+            for item in iter {
+                if let Ok((key, _)) = item {
+                    if !key.starts_with(b"temporal_facts:") {
+                        break;
+                    }
+                    batch.delete(&key);
+                }
+            }
+            if facts_deleted > 0 || !batch.is_empty() {
+                if let Err(e) = db.write(batch) {
+                    tracing::warn!(error = %e, "Failed to clear facts during forget_all");
+                } else {
+                    tracing::info!(facts_deleted, "Semantic facts cleared during forget_all");
+                }
+            }
+        }
+
+        // Step 7: Clear interference history (in-memory + persisted)
+        {
+            let mut detector = self.interference_detector.write();
+            *detector = replay::InterferenceDetector::new();
+        }
+        if let Err(e) = self.long_term_memory.clear_all_interference_records() {
+            tracing::warn!(error = %e, "Failed to clear interference records during forget_all");
+        }
+
+        // Step 8: Reset stats last (reflects final state)
         {
             let mut stats = self.stats.write();
             stats.total_memories = 0;
@@ -3865,7 +4148,7 @@ impl MemorySystem {
     ) -> Result<()> {
         let mut memory = self.long_term_memory.get(memory_id)?;
         memory.set_parent(parent_id);
-        self.long_term_memory.store(&memory)
+        self.long_term_memory.update(&memory)
     }
 
     /// Get children of a memory
@@ -4330,6 +4613,130 @@ impl MemorySystem {
         }
     }
 
+    /// Connect extracted facts to the knowledge graph.
+    ///
+    /// For each fact, ensures all related entities exist as EntityNodes and creates
+    /// RelationshipEdges between all pairs. Uses L2Episodic tier because facts are
+    /// consolidated knowledge (survived 7-day aging + 2+ supporting memories).
+    /// `add_entity` upserts (increments mention_count if existing), and
+    /// `add_relationship` strengthens via Hebbian learning if the edge already exists.
+    fn connect_facts_to_graph(&self, facts: &[SemanticFact]) {
+        let graph = match &self.graph_memory {
+            Some(g) => g,
+            None => return,
+        };
+        let graph_guard = graph.read();
+        let now = chrono::Utc::now();
+        let mut entities_added = 0;
+        let mut edges_added = 0;
+
+        // Collect all unique entity names across all facts for batch encoding
+        let mut all_entity_names: Vec<String> = Vec::new();
+        for fact in facts {
+            for name in &fact.related_entities {
+                if !all_entity_names.contains(name) {
+                    all_entity_names.push(name.clone());
+                }
+            }
+        }
+
+        // Batch-encode entity names for concept-level dedup
+        let embedding_map: std::collections::HashMap<String, Vec<f32>> =
+            if all_entity_names.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let name_refs: Vec<&str> = all_entity_names.iter().map(|s| s.as_str()).collect();
+                match self.embedder.encode_batch(&name_refs) {
+                    Ok(embs) => all_entity_names.into_iter().zip(embs).collect(),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Fact entity name embedding failed, concept merge disabled"
+                        );
+                        std::collections::HashMap::new()
+                    }
+                }
+            };
+
+        for fact in facts {
+            // Ensure all related entities exist as graph nodes
+            for entity_name in &fact.related_entities {
+                let entity = crate::graph_memory::EntityNode {
+                    uuid: Uuid::new_v4(),
+                    name: entity_name.clone(),
+                    labels: vec![crate::graph_memory::EntityLabel::Concept],
+                    created_at: now,
+                    last_seen_at: now,
+                    mention_count: 1,
+                    summary: String::new(),
+                    attributes: std::collections::HashMap::new(),
+                    name_embedding: embedding_map.get(entity_name).cloned(),
+                    salience: fact.confidence * 0.5,
+                    is_proper_noun: entity_name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false),
+                };
+                if graph_guard.add_entity(entity).is_ok() {
+                    entities_added += 1;
+                }
+            }
+
+            // Create edges between all pairs of related entities with semantic weighting
+            let entities = &fact.related_entities;
+            let l2_base_weight = crate::graph_memory::EdgeTier::L2Episodic.initial_weight();
+            for i in 0..entities.len() {
+                for j in (i + 1)..entities.len() {
+                    if let (Ok(Some(e1)), Ok(Some(e2))) = (
+                        graph_guard.find_entity_by_name(&entities[i]),
+                        graph_guard.find_entity_by_name(&entities[j]),
+                    ) {
+                        let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
+                            (Some(emb1), Some(emb2)) => {
+                                let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
+                                EDGE_SEMANTIC_WEIGHT_FLOOR
+                                    + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
+                            }
+                            _ => 1.0,
+                        };
+
+                        let edge = crate::graph_memory::RelationshipEdge {
+                            uuid: Uuid::new_v4(),
+                            from_entity: e1.uuid,
+                            to_entity: e2.uuid,
+                            relation_type: crate::graph_memory::RelationType::RelatedTo,
+                            strength: l2_base_weight * semantic_weight,
+                            created_at: now,
+                            valid_at: now,
+                            invalidated_at: None,
+                            source_episode_id: None,
+                            context: fact.fact.chars().take(100).collect(),
+                            last_activated: now,
+                            activation_count: 1,
+                            ltp_status: crate::graph_memory::LtpStatus::None,
+                            tier: crate::graph_memory::EdgeTier::L2Episodic,
+                            activation_timestamps: None,
+                            entity_confidence: Some(fact.confidence),
+                        };
+                        if graph_guard.add_relationship(edge).is_ok() {
+                            edges_added += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if entities_added > 0 || edges_added > 0 {
+            tracing::debug!(
+                entities_added,
+                edges_added,
+                facts = facts.len(),
+                "Connected facts to knowledge graph"
+            );
+        }
+    }
+
     /// Get memory graph statistics
     pub fn graph_stats(&self) -> MemoryGraphStats {
         if let Some(graph) = &self.graph_memory {
@@ -4566,36 +4973,37 @@ impl MemorySystem {
                 let now = chrono::Utc::now();
 
                 // Phase 1: Build entity structs with proper labels from NER
-                let ner_lookup: std::collections::HashMap<String, (&str, f32)> = memory
+                let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
+
+                // Batch-encode entity names for concept-level dedup
+                let entity_names: Vec<&str> = memory
                     .experience
-                    .ner_entities
+                    .entities
                     .iter()
-                    .map(|r| {
-                        (
-                            r.text.to_lowercase(),
-                            (r.entity_type.as_str(), r.confidence),
-                        )
-                    })
+                    .map(|s| s.as_str())
                     .collect();
+                let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
+                    Vec::new()
+                } else {
+                    match self.embedder.encode_batch(&entity_names) {
+                        Ok(embs) => embs.into_iter().map(Some).collect(),
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Entity name embedding failed, concept merge disabled for this batch"
+                            );
+                            vec![None; entity_names.len()]
+                        }
+                    }
+                };
 
                 let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
                     .experience
                     .entities
                     .iter()
-                    .map(|entity_name| {
-                        let (label, salience) = if let Some((ner_type, confidence)) =
-                            ner_lookup.get(&entity_name.to_lowercase())
-                        {
-                            let label = match *ner_type {
-                                "PER" => crate::graph_memory::EntityLabel::Person,
-                                "ORG" => crate::graph_memory::EntityLabel::Organization,
-                                "LOC" => crate::graph_memory::EntityLabel::Location,
-                                _ => crate::graph_memory::EntityLabel::Concept,
-                            };
-                            (label, *confidence)
-                        } else {
-                            (crate::graph_memory::EntityLabel::Concept, 0.5)
-                        };
+                    .zip(entity_embeddings.into_iter())
+                    .map(|(entity_name, embedding)| {
+                        let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
                         crate::graph_memory::EntityNode {
                             uuid: Uuid::new_v4(),
                             name: entity_name.clone(),
@@ -4605,7 +5013,7 @@ impl MemorySystem {
                             mention_count: 1,
                             summary: String::new(),
                             attributes: std::collections::HashMap::new(),
-                            name_embedding: None,
+                            name_embedding: embedding,
                             salience,
                             is_proper_noun: entity_name
                                 .chars()
@@ -4635,6 +5043,8 @@ impl MemorySystem {
                     }
                 }
 
+                // Semantic edge weighting
+                let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
                 for (entity1, entity2) in cooccurrence_pairs {
                     if let (Ok(Some(e1)), Ok(Some(e2))) = (
                         graph_guard.find_entity_by_name(&entity1),
@@ -4642,12 +5052,21 @@ impl MemorySystem {
                     ) {
                         let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
 
+                        let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
+                            (Some(emb1), Some(emb2)) => {
+                                let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
+                                EDGE_SEMANTIC_WEIGHT_FLOOR
+                                    + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
+                            }
+                            _ => 1.0,
+                        };
+
                         let edge = crate::graph_memory::RelationshipEdge {
                             uuid: Uuid::new_v4(),
                             from_entity: e1.uuid,
                             to_entity: e2.uuid,
                             relation_type: crate::graph_memory::RelationType::CoOccurs,
-                            strength: crate::graph_memory::EdgeTier::L1Working.initial_weight(),
+                            strength: l1_base_weight * semantic_weight,
                             created_at: now,
                             valid_at: now,
                             invalidated_at: None,
@@ -4731,7 +5150,7 @@ impl MemorySystem {
     ///
     /// Returns the number of memories processed for activation decay.
     /// Also records consolidation events for introspection.
-    pub fn run_maintenance(&self, decay_factor: f32) -> Result<MaintenanceResult> {
+    pub fn run_maintenance(&self, decay_factor: f32, user_id: &str) -> Result<MaintenanceResult> {
         let start_time = std::time::Instant::now();
         let now = chrono::Utc::now();
 
@@ -4868,6 +5287,155 @@ impl MemorySystem {
                 facts_decayed,
                 facts_deleted
             );
+        }
+
+        // 3.7. Fact extraction: consolidate episodic memories into semantic facts
+        // Runs SemanticConsolidator to extract patterns, procedures, preferences, etc.
+        // Deduplicates against existing facts via hybrid embedding+entity+polarity pipeline
+        // Connects newly extracted facts to the knowledge graph as L2 entity edges
+        let mut facts_extracted_count = 0;
+        let mut facts_reinforced_count = 0;
+        {
+            let all_memories = self.get_all_memories().unwrap_or_default();
+            if !all_memories.is_empty() {
+                let memories: Vec<Memory> = all_memories
+                    .into_iter()
+                    .map(|arc_mem| (*arc_mem).clone())
+                    .collect();
+
+                let consolidator = compression::SemanticConsolidator::new();
+                let consolidation_result = consolidator.consolidate(&memories);
+
+                if !consolidation_result.new_facts.is_empty() {
+                    // Batch-encode all new fact texts for hybrid dedup
+                    let fact_texts: Vec<&str> = consolidation_result
+                        .new_facts
+                        .iter()
+                        .map(|f| f.fact.as_str())
+                        .collect();
+                    let fact_embeddings: Vec<Option<Vec<f32>>> = match self
+                        .embedder
+                        .encode_batch(&fact_texts)
+                    {
+                        Ok(embs) => embs.into_iter().map(Some).collect(),
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Fact embedding batch failed, falling back to Jaccard-only dedup"
+                            );
+                            vec![None; fact_texts.len()]
+                        }
+                    };
+
+                    let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
+
+                    for (fact, embedding) in consolidation_result
+                        .new_facts
+                        .iter()
+                        .zip(fact_embeddings.into_iter())
+                    {
+                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
+                        match self.fact_store.find_similar(
+                            user_id,
+                            &fact.fact,
+                            &fact.related_entities,
+                            embedding.as_deref(),
+                        ) {
+                            Ok(Some(mut existing)) => {
+                                // Reinforce the existing fact
+                                existing.support_count += 1;
+                                existing.last_reinforced = now;
+                                let confidence_before = existing.confidence;
+                                let boost = 0.1 * (1.0 - existing.confidence);
+                                existing.confidence = (existing.confidence + boost).min(1.0);
+
+                                // Extend source memories and related entities
+                                for src in &fact.source_memories {
+                                    if !existing.source_memories.contains(src) {
+                                        existing.source_memories.push(src.clone());
+                                    }
+                                }
+                                for entity in &fact.related_entities {
+                                    if !existing.related_entities.contains(entity) {
+                                        existing.related_entities.push(entity.clone());
+                                    }
+                                }
+
+                                if let Err(e) = self.fact_store.update(user_id, &existing) {
+                                    tracing::debug!("Failed to reinforce fact: {e}");
+                                } else {
+                                    // Update existing fact's embedding with latest encoding
+                                    if let Some(ref emb) = embedding {
+                                        let _ = self.fact_store.store_embedding(
+                                            user_id,
+                                            &existing.id,
+                                            emb,
+                                        );
+                                    }
+                                    facts_reinforced_count += 1;
+                                    self.record_consolidation_event_for_user(
+                                        user_id,
+                                        ConsolidationEvent::FactReinforced {
+                                            fact_id: existing.id.clone(),
+                                            fact_content: existing.fact.clone(),
+                                            confidence_before,
+                                            confidence_after: existing.confidence,
+                                            new_support_count: existing.support_count,
+                                            timestamp: now,
+                                        },
+                                    );
+                                }
+                            }
+                            _ => {
+                                truly_new.push((fact.clone(), embedding));
+                            }
+                        }
+                    }
+
+                    // Store new facts
+                    if !truly_new.is_empty() {
+                        let facts_only: Vec<SemanticFact> =
+                            truly_new.iter().map(|(f, _)| f.clone()).collect();
+                        match self.fact_store.store_batch(user_id, &facts_only) {
+                            Ok(stored) => {
+                                facts_extracted_count = stored;
+                                // Store embeddings for newly persisted facts
+                                for (fact, embedding) in &truly_new {
+                                    if let Some(emb) = embedding {
+                                        let _ =
+                                            self.fact_store.store_embedding(user_id, &fact.id, emb);
+                                    }
+                                    self.record_consolidation_event_for_user(
+                                        user_id,
+                                        ConsolidationEvent::FactExtracted {
+                                            fact_id: fact.id.clone(),
+                                            fact_content: fact.fact.clone(),
+                                            confidence: fact.confidence,
+                                            fact_type: format!("{:?}", fact.fact_type),
+                                            source_memory_count: fact.source_memories.len(),
+                                            timestamp: now,
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to store extracted facts: {e}");
+                            }
+                        }
+
+                        // Connect newly extracted facts to the knowledge graph
+                        self.connect_facts_to_graph(&facts_only);
+                    }
+
+                    if facts_extracted_count > 0 || facts_reinforced_count > 0 {
+                        tracing::debug!(
+                            extracted = facts_extracted_count,
+                            reinforced = facts_reinforced_count,
+                            "Fact consolidation during maintenance"
+                        );
+                    }
+                }
+            }
         }
 
         // 4. SHO-105 + PIPE-2: Memory replay cycle (pattern-triggered consolidation)
@@ -5061,6 +5629,8 @@ impl MemorySystem {
             edge_boosts: replay_result.edge_boosts,
             memories_replayed: replay_result.memories_replayed,
             total_priority_score: replay_result.total_priority_score,
+            facts_extracted: facts_extracted_count,
+            facts_reinforced: facts_reinforced_count,
         })
     }
 
@@ -5115,24 +5685,29 @@ impl MemorySystem {
             events.events_since(since)
         };
 
-        // Combine events, deduplicating by timestamp (persisted events may also be in buffer)
+        // Combine events, deduplicating by (timestamp, event_type) to avoid
+        // dropping distinct events that share a nanosecond timestamp.
         let mut all_events: Vec<ConsolidationEvent> = Vec::new();
-        let mut seen_timestamps: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut seen_keys: std::collections::HashSet<(
+            i64,
+            std::mem::Discriminant<ConsolidationEvent>,
+        )> = std::collections::HashSet::new();
 
         // Add persisted events first (these are significant events that survived restart)
         for stored in &persisted_events {
             let ts = stored.event.timestamp().timestamp_nanos_opt().unwrap_or(0);
-            if !seen_timestamps.contains(&ts) {
-                seen_timestamps.insert(ts);
+            let key = (ts, std::mem::discriminant(&stored.event));
+            if seen_keys.insert(key) {
                 all_events.push(stored.event.clone());
             }
         }
 
         // Add ephemeral events that aren't already included
+        let until_nanos = until.timestamp_nanos_opt().unwrap_or(i64::MAX);
         for event in ephemeral_events {
             let ts = event.timestamp().timestamp_nanos_opt().unwrap_or(0);
-            if ts <= until.timestamp_nanos_opt().unwrap_or(0) && !seen_timestamps.contains(&ts) {
-                seen_timestamps.insert(ts);
+            let key = (ts, std::mem::discriminant(&event));
+            if ts <= until_nanos && seen_keys.insert(key) {
                 all_events.push(event);
             }
         }
@@ -5263,6 +5838,14 @@ impl MemorySystem {
                 "Semantic distillation complete"
             );
 
+            // Batch-encode and store embeddings for distilled facts
+            let texts: Vec<&str> = result.new_facts.iter().map(|f| f.fact.as_str()).collect();
+            if let Ok(batch_embs) = self.embedder.encode_batch(&texts) {
+                for (fact, emb) in result.new_facts.iter().zip(batch_embs.iter()) {
+                    let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
+                }
+            }
+
             // Record consolidation event for each fact (persists significant events)
             for fact in &result.new_facts {
                 self.record_consolidation_event_for_user(
@@ -5339,6 +5922,39 @@ impl MemorySystem {
     /// Get statistics about stored facts
     pub fn get_fact_stats(&self, user_id: &str) -> Result<facts::FactStats> {
         self.fact_store.stats(user_id)
+    }
+
+    /// Get facts associated with graph entity names.
+    ///
+    /// Bridges graph traversal → fact retrieval: when spreading activation discovers
+    /// entity nodes, this method returns the semantic facts linked to those entities.
+    /// Results are deduplicated and sorted by confidence (highest first).
+    pub fn get_facts_for_graph_entities(
+        &self,
+        user_id: &str,
+        entity_names: &[String],
+        limit_per_entity: usize,
+    ) -> Result<Vec<SemanticFact>> {
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut results = Vec::new();
+
+        for name in entity_names {
+            let facts = self
+                .fact_store
+                .find_by_entity(user_id, name, limit_per_entity)?;
+            for fact in facts {
+                if seen_ids.insert(fact.id.clone()) {
+                    results.push(fact);
+                }
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results)
     }
 
     /// Reinforce a fact with new supporting evidence

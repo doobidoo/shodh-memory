@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::constants::LTP_MIN_STRENGTH;
+use crate::constants::{ENTITY_CONCEPT_MERGE_THRESHOLD, LTP_MIN_STRENGTH};
 
 /// Entity node in the knowledge graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,8 +420,8 @@ impl RelationshipEdge {
                 if let Some(next_tier) = self.tier.next_tier() {
                     let old_tier = self.tier;
                     self.tier = next_tier;
-                    // Reset strength to next tier's initial weight (consolidation)
-                    self.strength = next_tier.initial_weight();
+                    // Preserve strength if already above next tier's initial weight
+                    self.strength = self.strength.max(next_tier.initial_weight());
 
                     // PIPE-4: Initialize activation_timestamps on L1→L2 promotion
                     if old_tier == EdgeTier::L1Working {
@@ -436,7 +436,10 @@ impl RelationshipEdge {
                     // Expand capacity on L2→L3 promotion
                     if old_tier == EdgeTier::L2Episodic {
                         if let Some(ref mut ts) = self.activation_timestamps {
-                            ts.reserve(ACTIVATION_HISTORY_L3_CAPACITY - ts.capacity());
+                            let current = ts.capacity();
+                            if current < ACTIVATION_HISTORY_L3_CAPACITY {
+                                ts.reserve(ACTIVATION_HISTORY_L3_CAPACITY - current);
+                            }
                         }
                     }
 
@@ -917,6 +920,10 @@ pub struct GraphMemory {
     /// RocksDB storage for entity -> relationships index
     entity_edges_db: Arc<DB>,
 
+    /// RocksDB storage for entity-pair -> edge UUID index (O(1) dedup lookups)
+    /// Key: "{min_uuid}:{max_uuid}" (canonical order), Value: edge UUID bytes
+    entity_pair_index_db: Arc<DB>,
+
     /// RocksDB storage for entity -> episodes index (inverted index for fast lookup)
     entity_episodes_db: Arc<DB>,
 
@@ -953,6 +960,12 @@ pub struct GraphMemory {
     /// Mutex for serializing synapse updates to prevent race conditions (SHO-64)
     /// Uses parking_lot::Mutex for better performance than std::sync::Mutex
     synapse_update_lock: Arc<parking_lot::Mutex<()>>,
+
+    /// In-memory cache of entity name embeddings for concept merging.
+    /// Maps entity UUID → embedding vector. Loaded on startup, updated on add.
+    /// Used when string-based dedup (exact/case/stemmed) fails — catches synonyms
+    /// like "authentication" ↔ "auth" via cosine similarity.
+    entity_embedding_cache: Arc<parking_lot::RwLock<Vec<(Uuid, Vec<f32>)>>>,
 }
 
 impl GraphMemory {
@@ -968,6 +981,7 @@ impl GraphMemory {
         let relationships_db = Arc::new(DB::open(&opts, path.join("graph_relationships"))?);
         let episodes_db = Arc::new(DB::open(&opts, path.join("graph_episodes"))?);
         let entity_edges_db = Arc::new(DB::open(&opts, path.join("graph_entity_edges"))?);
+        let entity_pair_index_db = Arc::new(DB::open(&opts, path.join("graph_entity_pair_index"))?);
         let entity_episodes_db = Arc::new(DB::open(&opts, path.join("graph_entity_episodes"))?);
         let entity_name_index_db = Arc::new(DB::open(&opts, path.join("graph_entity_name_index"))?);
         let entity_lowercase_index_db =
@@ -995,11 +1009,18 @@ impl GraphMemory {
         let relationship_count = Self::count_db_entries(&relationships_db);
         let episode_count = Self::count_db_entries(&episodes_db);
 
+        // Load entity embedding cache for concept merging
+        // Only entities with pre-computed name_embeddings are cached
+        let entity_embedding_cache =
+            Self::load_entity_embedding_cache(&entities_db, &entity_name_index);
+        let embedding_cache_size = entity_embedding_cache.len();
+
         let graph = Self {
             entities_db,
             relationships_db,
             episodes_db,
             entity_edges_db,
+            entity_pair_index_db,
             entity_episodes_db,
             entity_name_index_db,
             entity_lowercase_index_db,
@@ -1011,12 +1032,14 @@ impl GraphMemory {
             relationship_count: Arc::new(AtomicUsize::new(relationship_count)),
             episode_count: Arc::new(AtomicUsize::new(episode_count)),
             synapse_update_lock: Arc::new(parking_lot::Mutex::new(())),
+            entity_embedding_cache: Arc::new(parking_lot::RwLock::new(entity_embedding_cache)),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
             tracing::info!(
-                "Loaded graph with {} entities, {} relationships, {} episodes",
+                "Loaded graph with {} entities ({} with embeddings), {} relationships, {} episodes",
                 entity_count,
+                embedding_cache_size,
                 relationship_count,
                 episode_count
             );
@@ -1155,28 +1178,108 @@ impl GraphMemory {
         db.iterator(rocksdb::IteratorMode::Start).count()
     }
 
+    /// Load entity embedding cache from persisted entities.
+    ///
+    /// Scans entities referenced by the name index and collects those with
+    /// pre-computed name_embeddings into an in-memory cache for O(n) concept
+    /// merging during `add_entity()`. Entities without embeddings (pre-upgrade
+    /// data) are skipped and will gain embeddings on their next mention.
+    fn load_entity_embedding_cache(
+        entities_db: &DB,
+        name_index: &HashMap<String, Uuid>,
+    ) -> Vec<(Uuid, Vec<f32>)> {
+        let mut cache = Vec::new();
+        for uuid in name_index.values() {
+            let key = uuid.as_bytes();
+            if let Ok(Some(value)) = entities_db.get(key) {
+                if let Ok((entity, _)) = bincode::serde::decode_from_slice::<EntityNode, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
+                    if let Some(emb) = entity.name_embedding {
+                        cache.push((*uuid, emb));
+                    }
+                }
+            }
+        }
+        cache
+    }
+
     /// Add or update an entity node
     /// Salience is updated using the formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
     /// This means frequently mentioned entities grow in salience (gravitational wells get heavier)
     ///
     /// BUG-002 FIX: Handles crash recovery for orphaned entities/stale indices
     pub fn add_entity(&self, mut entity: EntityNode) -> Result<Uuid> {
-        // Check if entity already exists by name
-        let existing_uuid = {
+        // Multi-tier dedup pipeline: exact → case-insensitive → stemmed → embedding
+        // Each tier is faster than the next; short-circuits on first match.
+
+        // Tier 1: Exact name match (O(1))
+        let mut existing_uuid = {
             let index = self.entity_name_index.read();
             index.get(&entity.name).cloned()
         };
+
+        // Tier 2: Case-insensitive match (O(1))
+        if existing_uuid.is_none() {
+            let lowercase_name = entity.name.to_lowercase();
+            let index = self.entity_lowercase_index.read();
+            existing_uuid = index.get(&lowercase_name).cloned();
+        }
+
+        // Tier 3: Stemmed match (O(1)) — "running" matches "run"
+        if existing_uuid.is_none() {
+            let stemmer = Stemmer::create(Algorithm::English);
+            let stemmed_name = Self::stem_entity_name(&stemmer, &entity.name);
+            let index = self.entity_stemmed_index.read();
+            existing_uuid = index.get(&stemmed_name).cloned();
+        }
+
+        // Tier 4: Embedding-based concept merge (O(n) over cache)
+        // Catches synonyms like "authentication" ↔ "auth" that string matching misses.
+        // Only runs when the entity carries a name_embedding (populated by caller).
+        if existing_uuid.is_none() {
+            if let Some(ref new_emb) = entity.name_embedding {
+                let cache = self.entity_embedding_cache.read();
+                let mut best_match: Option<(Uuid, f32)> = None;
+                for (uuid, existing_emb) in cache.iter() {
+                    let sim = crate::similarity::cosine_similarity(new_emb, existing_emb);
+                    if sim >= ENTITY_CONCEPT_MERGE_THRESHOLD {
+                        if best_match.map_or(true, |(_, best_sim)| sim > best_sim) {
+                            best_match = Some((*uuid, sim));
+                        }
+                    }
+                }
+                if let Some((matched_uuid, sim)) = best_match {
+                    tracing::debug!(
+                        "Concept merge: '{}' matched existing entity {} (cosine={:.3})",
+                        entity.name,
+                        matched_uuid,
+                        sim
+                    );
+                    existing_uuid = Some(matched_uuid);
+                }
+            }
+        }
 
         let is_new_entity;
         if let Some(uuid) = existing_uuid {
             // BUG-002 FIX: Verify entity actually exists in DB (handles stale index)
             if let Some(existing) = self.get_entity(&uuid)? {
-                // Update existing entity
+                // Update existing entity — merge into canonical node
                 entity.uuid = uuid;
                 entity.mention_count = existing.mention_count + 1;
                 entity.last_seen_at = Utc::now();
-                entity.created_at = existing.created_at; // Preserve original creation time
+                entity.created_at = existing.created_at;
                 entity.is_proper_noun = existing.is_proper_noun || entity.is_proper_noun;
+
+                // Preserve the canonical name (first-seen name wins)
+                entity.name = existing.name.clone();
+
+                // Preserve existing embedding if the incoming one is None
+                if entity.name_embedding.is_none() {
+                    entity.name_embedding = existing.name_embedding;
+                }
 
                 // Update salience with frequency boost
                 // Formula: salience = base_salience * (1 + 0.1 * ln(mention_count))
@@ -1186,7 +1289,6 @@ impl GraphMemory {
                 is_new_entity = false;
             } else {
                 // BUG-002 FIX: Stale index entry - entity in index but not in DB
-                // Treat as new entity (index will be updated below)
                 tracing::warn!(
                     "Stale index entry for entity '{}' (uuid={}), recreating",
                     entity.name,
@@ -1199,25 +1301,20 @@ impl GraphMemory {
                 is_new_entity = true;
             }
         } else {
-            // New entity
+            // Genuinely new entity — no match at any tier
             entity.uuid = Uuid::new_v4();
             entity.created_at = Utc::now();
             entity.last_seen_at = entity.created_at;
             entity.mention_count = 1;
-            // Salience stays at base_salience for new entities
             is_new_entity = true;
         }
 
         // BUG-002 FIX: Write index FIRST, then entity
-        // Rationale: If crash after index write but before entity write,
-        // next add_entity call will detect stale index (above) and recover.
-        // This is safer than orphaned entities with no index reference.
-
         let lowercase_name = entity.name.to_lowercase();
         let stemmer = Stemmer::create(Algorithm::English);
         let stemmed_name = Self::stem_entity_name(&stemmer, &entity.name);
 
-        // Update in-memory indices first
+        // Update in-memory indices
         {
             let mut index = self.entity_name_index.write();
             index.insert(entity.name.clone(), entity.uuid);
@@ -1231,6 +1328,19 @@ impl GraphMemory {
             stemmed_index.insert(stemmed_name.clone(), entity.uuid);
         }
 
+        // Update entity embedding cache for future concept merges
+        if let Some(ref emb) = entity.name_embedding {
+            let mut cache = self.entity_embedding_cache.write();
+            if is_new_entity {
+                cache.push((entity.uuid, emb.clone()));
+            } else {
+                // Update existing entry in cache (embedding may have changed)
+                if let Some(entry) = cache.iter_mut().find(|(uuid, _)| *uuid == entity.uuid) {
+                    entry.1 = emb.clone();
+                }
+            }
+        }
+
         // Persist name->UUID mappings
         self.entity_name_index_db
             .put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
@@ -1239,7 +1349,7 @@ impl GraphMemory {
         self.entity_stemmed_index_db
             .put(stemmed_name.as_bytes(), entity.uuid.as_bytes())?;
 
-        // Now store entity in database
+        // Store entity in database
         let key = entity.uuid.as_bytes();
         let value = bincode::serde::encode_to_vec(&entity, bincode::config::standard())?;
         self.entities_db.put(key, value)?;
@@ -1398,18 +1508,64 @@ impl GraphMemory {
         Ok(results)
     }
 
+    /// Canonical pair key for the entity-pair index.
+    /// Uses min/max UUID ordering so A→B and B→A produce the same key.
+    fn pair_key(entity_a: &Uuid, entity_b: &Uuid) -> String {
+        if entity_a < entity_b {
+            format!("{entity_a}:{entity_b}")
+        } else {
+            format!("{entity_b}:{entity_a}")
+        }
+    }
+
+    /// Index an entity pair → edge UUID for O(1) dedup lookups
+    fn index_entity_pair(&self, entity_a: &Uuid, entity_b: &Uuid, edge_uuid: &Uuid) -> Result<()> {
+        let key = Self::pair_key(entity_a, entity_b);
+        self.entity_pair_index_db
+            .put(key.as_bytes(), edge_uuid.as_bytes())?;
+        Ok(())
+    }
+
+    /// Remove entity pair from the pair index
+    fn remove_entity_pair_index(&self, entity_a: &Uuid, entity_b: &Uuid) -> Result<()> {
+        let key = Self::pair_key(entity_a, entity_b);
+        self.entity_pair_index_db.delete(key.as_bytes())?;
+        Ok(())
+    }
+
     /// Find existing relationship between two entities (either direction)
+    ///
+    /// O(1) lookup via entity-pair index, with fallback to linear scan
+    /// for edges created before the pair index existed (migration path).
     pub fn find_relationship_between(
         &self,
         entity_a: &Uuid,
         entity_b: &Uuid,
     ) -> Result<Option<RelationshipEdge>> {
-        // Check edges from entity_a
+        // Fast path: O(1) pair index lookup
+        let key = Self::pair_key(entity_a, entity_b);
+        if let Some(edge_uuid_bytes) = self.entity_pair_index_db.get(key.as_bytes())? {
+            if edge_uuid_bytes.len() == 16 {
+                let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
+                if let Some(edge) = self.get_relationship(&edge_uuid)? {
+                    return Ok(Some(edge));
+                }
+                // Edge was deleted but pair index is stale — clean up and fall through
+                let _ = self.entity_pair_index_db.delete(key.as_bytes());
+            }
+        }
+
+        // Slow path: linear scan for pre-index edges (backward compatibility)
+        // This path is only hit for edges created before the pair index existed.
+        // Once all old edges are either strengthened (which updates the index) or
+        // pruned, this path becomes dead code.
         let edges_a = self.get_entity_relationships(entity_a)?;
         for edge in edges_a {
             if (edge.from_entity == *entity_a && edge.to_entity == *entity_b)
                 || (edge.from_entity == *entity_b && edge.to_entity == *entity_a)
             {
+                // Backfill pair index for this legacy edge
+                let _ = self.index_entity_pair(entity_a, entity_b, &edge.uuid);
                 return Ok(Some(edge));
             }
         }
@@ -1460,6 +1616,15 @@ impl GraphMemory {
         self.index_entity_edge(&edge.from_entity, &edge.uuid)?;
         self.index_entity_edge(&edge.to_entity, &edge.uuid)?;
 
+        // Update entity-pair index for O(1) dedup lookups
+        self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid)?;
+
+        // Insert-time degree pruning: cap edges per entity to prevent O(n²) explosion.
+        // If either entity exceeds MAX_ENTITY_DEGREE, prune the weakest edges.
+        // This is the primary defense against graph bloat (132MB for 600KB of content).
+        self.prune_entity_if_over_degree(&edge.from_entity)?;
+        self.prune_entity_if_over_degree(&edge.to_entity)?;
+
         Ok(edge.uuid)
     }
 
@@ -1467,6 +1632,91 @@ impl GraphMemory {
     fn index_entity_edge(&self, entity_uuid: &Uuid, edge_uuid: &Uuid) -> Result<()> {
         let key = format!("{entity_uuid}:{edge_uuid}");
         self.entity_edges_db.put(key.as_bytes(), b"1")?;
+        Ok(())
+    }
+
+    /// Prune an entity's edges if degree exceeds MAX_ENTITY_DEGREE
+    ///
+    /// Loads all edges for the entity, sorts by effective strength, and deletes
+    /// the weakest edges that exceed the cap. LTP-protected edges are preserved
+    /// preferentially (sorted last, so they survive pruning).
+    ///
+    /// This is called at insert time to prevent unbounded edge growth.
+    /// Amortized cost: O(1) for most insertions (only triggers when over cap),
+    /// O(d log d) when pruning is needed (d = entity degree).
+    fn prune_entity_if_over_degree(&self, entity_uuid: &Uuid) -> Result<()> {
+        use crate::constants::MAX_ENTITY_DEGREE;
+
+        // Fast path: count edges without loading them
+        let prefix = format!("{entity_uuid}:");
+        let iter = self.entity_edges_db.prefix_iterator(prefix.as_bytes());
+
+        let mut edge_count = 0usize;
+        for (key, _) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                edge_count += 1;
+            }
+        }
+
+        if edge_count <= MAX_ENTITY_DEGREE {
+            return Ok(());
+        }
+
+        // Over cap — load all edges, sort, prune weakest
+        let all_edges = self.get_entity_relationships(entity_uuid)?;
+        if all_edges.len() <= MAX_ENTITY_DEGREE {
+            return Ok(()); // Race condition guard
+        }
+
+        // Sort by pruning priority: LTP-protected edges last (survive pruning),
+        // then by effective strength descending (strongest survive)
+        let mut scored: Vec<(Uuid, f32, bool)> = all_edges
+            .iter()
+            .map(|e| {
+                let is_protected = e.is_potentiated();
+                (e.uuid, e.effective_strength(), is_protected)
+            })
+            .collect();
+
+        // Sort: unprotected+weak first (pruning candidates), protected+strong last (survivors)
+        scored.sort_by(|a, b| {
+            // Protected edges sort after unprotected
+            match a.2.cmp(&b.2) {
+                CmpOrdering::Equal => {
+                    // Within same protection class, weaker edges first (prune candidates)
+                    a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal)
+                }
+                other => other,
+            }
+        });
+
+        // Prune excess: first N edges in sorted order are weakest/unprotected
+        let prune_count = scored.len() - MAX_ENTITY_DEGREE;
+        let to_prune: Vec<Uuid> = scored.iter().take(prune_count).map(|s| s.0).collect();
+
+        for edge_uuid in &to_prune {
+            if let Err(e) = self.delete_relationship(edge_uuid) {
+                tracing::warn!(
+                    edge = %edge_uuid,
+                    entity = %entity_uuid,
+                    "Failed to prune edge during degree cap: {}",
+                    e
+                );
+            }
+        }
+
+        if !to_prune.is_empty() {
+            tracing::info!(
+                entity = %entity_uuid,
+                pruned = to_prune.len(),
+                remaining = MAX_ENTITY_DEGREE,
+                "Pruned edges exceeding degree cap"
+            );
+        }
+
         Ok(())
     }
 
@@ -1478,27 +1728,26 @@ impl GraphMemory {
         self.get_entity_relationships_limited(entity_uuid, None)
     }
 
-    /// Get relationships for an entity with limit
+    /// Get relationships for an entity with limit, ordered by effective strength
     ///
-    /// Collects edge UUIDs first, then batch-reads them using multi_get.
-    /// This eliminates the N+1 query pattern that was causing 60s+ delays.
+    /// Collects ALL edge UUIDs first, batch-reads them, sorts by effective_strength
+    /// descending, then returns the top `limit` strongest edges. This ensures
+    /// traversal and queries always use the most valuable connections.
+    ///
+    /// When no limit is specified, returns all edges sorted by strength.
     pub fn get_entity_relationships_limited(
         &self,
         entity_uuid: &Uuid,
         limit: Option<usize>,
     ) -> Result<Vec<RelationshipEdge>> {
         let prefix = format!("{entity_uuid}:");
-        let max_edges = limit.unwrap_or(usize::MAX);
 
-        // Phase 1: Collect edge UUIDs from index (fast prefix scan)
-        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(max_edges.min(256));
+        // Phase 1: Collect ALL edge UUIDs from index (fast prefix scan)
+        // We must read all to sort by strength — storage order is arbitrary
+        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
         let iter = self.entity_edges_db.prefix_iterator(prefix.as_bytes());
 
         for (key, _) in iter.flatten() {
-            if edge_uuids.len() >= max_edges {
-                break;
-            }
-
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
                     break;
@@ -1530,6 +1779,18 @@ impl GraphMemory {
             ) {
                 edges.push(edge);
             }
+        }
+
+        // Phase 3: Sort by effective strength descending (strongest first)
+        edges.sort_by(|a, b| {
+            b.effective_strength()
+                .partial_cmp(&a.effective_strength())
+                .unwrap_or(CmpOrdering::Equal)
+        });
+
+        // Phase 4: Truncate to limit if specified
+        if let Some(max) = limit {
+            edges.truncate(max);
         }
 
         Ok(edges)
@@ -1684,9 +1945,18 @@ impl GraphMemory {
         // Remove from entity_edges index for BOTH entities
         // (add_relationship indexes both from_entity and to_entity)
         let from_key = format!("{}:{}", edge.from_entity, uuid);
-        let _ = self.entity_edges_db.delete(from_key.as_bytes());
+        if let Err(e) = self.entity_edges_db.delete(from_key.as_bytes()) {
+            tracing::warn!(edge = %uuid, key = %from_key, error = %e, "Failed to delete from entity_edges index");
+        }
         let to_key = format!("{}:{}", edge.to_entity, uuid);
-        let _ = self.entity_edges_db.delete(to_key.as_bytes());
+        if let Err(e) = self.entity_edges_db.delete(to_key.as_bytes()) {
+            tracing::warn!(edge = %uuid, key = %to_key, error = %e, "Failed to delete from entity_edges index");
+        }
+
+        // Remove from entity-pair index
+        if let Err(e) = self.remove_entity_pair_index(&edge.from_entity, &edge.to_entity) {
+            tracing::warn!(edge = %uuid, "Failed to delete from entity_pair index: {}", e);
+        }
 
         Ok(true)
     }
@@ -1712,7 +1982,9 @@ impl GraphMemory {
         // Remove from entity_episodes inverted index
         for entity_uuid in &episode.entity_refs {
             let key = format!("{entity_uuid}:{episode_uuid}");
-            let _ = self.entity_episodes_db.delete(key.as_bytes());
+            if let Err(e) = self.entity_episodes_db.delete(key.as_bytes()) {
+                tracing::warn!(episode = %episode_uuid, key = %key, error = %e, "Failed to delete from entity_episodes index");
+            }
         }
 
         // Delete edges sourced from this episode
@@ -1762,6 +2034,7 @@ impl GraphMemory {
             &self.relationships_db,
             &self.episodes_db,
             &self.entity_edges_db,
+            &self.entity_pair_index_db,
             &self.entity_episodes_db,
             &self.entity_name_index_db,
             &self.entity_lowercase_index_db,
@@ -1842,28 +2115,45 @@ impl GraphMemory {
     /// Get all episodes that contain a specific entity
     ///
     /// Uses inverted index for O(k) lookup instead of O(n) full scan.
+    /// Collects episode UUIDs first, then batch-reads them using multi_get.
     /// Crucial for spreading activation algorithm.
     pub fn get_episodes_by_entity(&self, entity_uuid: &Uuid) -> Result<Vec<EpisodicNode>> {
-        let mut episodes = Vec::new();
         let prefix = format!("{entity_uuid}:");
         tracing::debug!("get_episodes_by_entity: prefix {}", &prefix[..12]);
 
-        // Use inverted index: entity_uuid -> episode_uuids
+        // Phase 1: Collect episode UUIDs from index (fast prefix scan, no data transfer)
+        let mut episode_uuids: Vec<Uuid> = Vec::new();
         let iter = self.entity_episodes_db.prefix_iterator(prefix.as_bytes());
         for (key, _) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
-                    break; // Prefix iterator exhausted
+                    break;
                 }
-
-                // Extract episode UUID from key
                 if let Some(episode_uuid_str) = key_str.split(':').nth(1) {
                     if let Ok(episode_uuid) = Uuid::parse_str(episode_uuid_str) {
-                        if let Some(episode) = self.get_episode(&episode_uuid)? {
-                            episodes.push(episode);
-                        }
+                        episode_uuids.push(episode_uuid);
                     }
                 }
+            }
+        }
+
+        if episode_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: Batch read all episodes using multi_get (single RocksDB call)
+        let keys: Vec<[u8; 16]> = episode_uuids.iter().map(|u| *u.as_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+
+        let results = self.episodes_db.multi_get(&key_refs);
+
+        let mut episodes = Vec::with_capacity(episode_uuids.len());
+        for value in results.into_iter().flatten().flatten() {
+            if let Ok((episode, _)) = bincode::serde::decode_from_slice::<EpisodicNode, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                episodes.push(episode);
             }
         }
 
@@ -2043,11 +2333,10 @@ impl GraphMemory {
         }
         impl Ord for PQEntry {
             fn cmp(&self, other: &Self) -> CmpOrdering {
-                // Reverse for max-heap (higher score = higher priority)
+                // BinaryHeap is a max-heap: higher score = popped first = explored first
                 self.score
                     .partial_cmp(&other.score)
                     .unwrap_or(CmpOrdering::Equal)
-                    .reverse()
             }
         }
 

@@ -2,6 +2,8 @@
 //!
 //! Core handlers for storing memories: remember, batch_remember, upsert.
 
+use std::collections::HashSet;
+
 use axum::{extract::State, response::Json};
 
 use super::health::AppState;
@@ -176,17 +178,23 @@ pub struct UpsertResponse {
 /// Parse memory type from string
 pub fn parse_experience_type(s: Option<&String>) -> ExperienceType {
     s.and_then(|s| match s.to_lowercase().as_str() {
-        "task" => Some(ExperienceType::Task),
-        "learning" => Some(ExperienceType::Learning),
+        "observation" => Some(ExperienceType::Observation),
         "decision" => Some(ExperienceType::Decision),
+        "learning" => Some(ExperienceType::Learning),
         "error" => Some(ExperienceType::Error),
-        "pattern" => Some(ExperienceType::Pattern),
-        "conversation" => Some(ExperienceType::Conversation),
         "discovery" => Some(ExperienceType::Discovery),
-        "observation" | "context" => Some(ExperienceType::Context),
+        "pattern" => Some(ExperienceType::Pattern),
+        "context" => Some(ExperienceType::Context),
+        "task" => Some(ExperienceType::Task),
+        "codeedit" | "code_edit" => Some(ExperienceType::CodeEdit),
+        "fileaccess" | "file_access" => Some(ExperienceType::FileAccess),
+        "search" => Some(ExperienceType::Search),
+        "command" => Some(ExperienceType::Command),
+        "conversation" => Some(ExperienceType::Conversation),
+        "intention" => Some(ExperienceType::Intention),
         _ => None,
     })
-    .unwrap_or(ExperienceType::Context)
+    .unwrap_or(ExperienceType::Observation)
 }
 
 /// Parse source type from string
@@ -324,25 +332,48 @@ pub async fn remember(
         tokio::task::spawn_blocking(move || yake.extract_texts(&content_for_yake))
     );
 
-    let ner_entities = ner_result.unwrap_or_default();
-    let extracted_keywords = yake_result.unwrap_or_default();
+    let ner_entities = match ner_result {
+        Ok(entities) => entities,
+        Err(e) => {
+            if e.is_panic() {
+                tracing::error!("NER extraction task panicked: {:?}", e);
+            } else {
+                tracing::debug!("NER extraction task cancelled: {:?}", e);
+            }
+            Vec::new()
+        }
+    };
+    let extracted_keywords = match yake_result {
+        Ok(keywords) => keywords,
+        Err(e) => {
+            if e.is_panic() {
+                tracing::error!("YAKE extraction task panicked: {:?}", e);
+            } else {
+                tracing::debug!("YAKE extraction task cancelled: {:?}", e);
+            }
+            Vec::new()
+        }
+    };
 
     let mut merged_entities: Vec<String> = req.tags.clone();
+    let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     for record in &ner_entities {
-        if !merged_entities
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&record.text))
-        {
+        if seen.insert(record.text.to_lowercase()) {
             merged_entities.push(record.text.clone());
         }
     }
     for keyword in extracted_keywords {
-        if !merged_entities
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&keyword))
-        {
+        if seen.insert(keyword.to_lowercase()) {
             merged_entities.push(keyword);
         }
+    }
+    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
+        tracing::debug!(
+            count = merged_entities.len(),
+            max = validation::MAX_ENTITIES_PER_MEMORY,
+            "Capping entities to maximum allowed"
+        );
+        merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
     }
 
     let experience_type_str = format!("{:?}", experience_type);
@@ -563,15 +594,25 @@ pub async fn batch_remember(
             let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
 
             let mut merged: Vec<String> = item.tags.clone();
+            let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
             for record in &ner_records {
-                if !merged.iter().any(|t| t.eq_ignore_ascii_case(&record.text)) {
+                if seen.insert(record.text.to_lowercase()) {
                     merged.push(record.text.clone());
                 }
             }
             for keyword in extracted_keywords {
-                if !merged.iter().any(|t| t.eq_ignore_ascii_case(&keyword)) {
+                if seen.insert(keyword.to_lowercase()) {
                     merged.push(keyword);
                 }
+            }
+            if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
+                tracing::debug!(
+                    batch_index = index,
+                    count = merged.len(),
+                    max = validation::MAX_ENTITIES_PER_MEMORY,
+                    "Capping entities to maximum allowed in batch item"
+                );
+                merged.truncate(validation::MAX_ENTITIES_PER_MEMORY);
             }
             (merged, ner_records)
         } else {
@@ -723,21 +764,24 @@ pub async fn upsert_memory(
     let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
 
     let mut merged_entities: Vec<String> = req.tags.clone();
+    let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     for record in &ner_entities {
-        if !merged_entities
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&record.text))
-        {
+        if seen.insert(record.text.to_lowercase()) {
             merged_entities.push(record.text.clone());
         }
     }
     for keyword in extracted_keywords {
-        if !merged_entities
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&keyword))
-        {
+        if seen.insert(keyword.to_lowercase()) {
             merged_entities.push(keyword);
         }
+    }
+    if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
+        tracing::debug!(
+            count = merged_entities.len(),
+            max = validation::MAX_ENTITIES_PER_MEMORY,
+            "Capping entities to maximum allowed in upsert"
+        );
+        merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
     }
 
     let experience = Experience {

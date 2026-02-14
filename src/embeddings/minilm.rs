@@ -12,7 +12,7 @@
 //! - SHODH_MODEL_PATH: Base path to model files (default: ./models/minilm-l6)
 //! - SHODH_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
 //! - SHODH_LAZY_LOAD: Set to "false" to load model at startup (default: true)
-//! - SHODH_ONNX_THREADS: Number of ONNX threads (default: 2 for edge, 4 for desktop)
+//! - SHODH_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, 2 elsewhere)
 
 use anyhow::{Context, Result};
 use ort::session::Session;
@@ -25,9 +25,19 @@ use tokenizers::Tokenizer;
 use super::Embedder;
 
 /// Thread-safe guard for ORT_DYLIB_PATH initialization.
-/// Using OnceLock ensures set_var is called exactly once, before other threads start.
-/// This mitigates the UB risk of concurrent env::set_var calls.
+/// Using OnceLock ensures set_var is called exactly once.
 static ORT_PATH_INIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+/// Pre-initialize the ONNX Runtime path before any async work begins.
+///
+/// # Safety
+/// This function calls `std::env::set_var` which is unsound in multi-threaded
+/// contexts (Rust 1.66+). It MUST be called before `tokio::main` spawns worker
+/// threads — i.e., very early in `async fn main()` before any `.await` or
+/// `tokio::spawn` calls. The OnceLock ensures it only runs once.
+pub fn pre_init_ort_runtime(offline_mode: bool) {
+    let _ = ORT_PATH_INIT.get_or_init(|| MiniLMEmbedder::init_ort_path_inner(offline_mode));
+}
 
 /// Lazily initialized ONNX session and tokenizer
 struct LazyModel {
@@ -37,10 +47,18 @@ struct LazyModel {
 
 impl LazyModel {
     fn new(config: &EmbeddingConfig) -> Result<Self> {
+        // macOS ARM64 (M1/M2/M3): default to 1 thread to avoid Eigen thread pool
+        // spin-to-block deadlock on heterogeneous P/E cores.
+        // See: https://github.com/microsoft/onnxruntime/issues/10270
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let default_threads = 1;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let default_threads = 2;
+
         let num_threads = std::env::var("SHODH_ONNX_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2); // Default 2 threads for edge devices
+            .unwrap_or(default_threads);
 
         tracing::info!(
             "Loading MiniLM-L6-v2 model from {:?} with {} threads",
@@ -48,10 +66,23 @@ impl LazyModel {
             num_threads
         );
 
-        let session = Session::builder()
+        let builder = Session::builder()
             .context("Failed to create session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set thread count")?
+            .context("Failed to set intra thread count")?
+            .with_inter_threads(1)
+            .context("Failed to set inter thread count")?;
+
+        // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
+        // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
+        // See: microsoft/onnxruntime#10270, pykeio/ort#516
+        let builder = builder
+            .with_intra_op_spinning(false)
+            .context("Failed to disable intra-op spinning")?
+            .with_inter_op_spinning(false)
+            .context("Failed to disable inter-op spinning")?;
+
+        let session = builder
             .commit_from_file(&config.model_path)
             .context("Failed to load ONNX model")?;
 
@@ -478,18 +509,18 @@ impl MiniLMEmbedder {
         use std::hash::{Hash, Hasher};
 
         let mut embedding = vec![0.0; self.dimension];
-        let mut hasher = DefaultHasher::new();
 
         // Use words and character n-grams for better quality
         let words: Vec<&str> = text.split_whitespace().collect();
 
         for (i, word) in words.iter().enumerate() {
+            let mut hasher = DefaultHasher::new();
             word.hash(&mut hasher);
             let hash = hasher.finish();
 
-            // Distribute hash bits across embedding dimensions
+            // Distribute hash bits across embedding dimensions with positional offset
             for j in 0..self.dimension {
-                let index = (i * self.dimension + j) % self.dimension;
+                let index = (i.wrapping_mul(7) + j) % self.dimension;
                 if j < 64 {
                     embedding[index] += ((hash >> j) & 1) as f32 * 0.1;
                 } else {
@@ -501,6 +532,7 @@ impl MiniLMEmbedder {
         // Add character bigram features for better semantic representation
         let chars: Vec<char> = text.chars().collect();
         for i in 0..chars.len().saturating_sub(1) {
+            let mut hasher = DefaultHasher::new();
             let bigram = format!("{}{}", chars[i], chars[i + 1]);
             bigram.hash(&mut hasher);
             let hash = hasher.finish();
@@ -511,8 +543,13 @@ impl MiniLMEmbedder {
             }
         }
 
-        // Normalize - if normalization fails (empty text), return zero vector
-        let _ = self.normalize(&mut embedding);
+        // Normalize - if normalization fails (empty text / NaN), return zero vector
+        if !self.normalize(&mut embedding) {
+            tracing::warn!(
+                "Embedding normalization failed (zero norm or NaN), returning zero vector"
+            );
+            embedding.iter_mut().for_each(|v| *v = 0.0);
+        }
 
         Ok(embedding)
     }
@@ -635,7 +672,18 @@ impl MiniLMEmbedder {
 
         // Lazy load model on first use
         let model = self.ensure_model_loaded()?;
-        let mut session = model.session.lock();
+        let lock_timeout = std::time::Duration::from_secs(30);
+        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+            tracing::error!(
+                "ONNX session lock timed out after {}s in batch embed — \
+                 a previous inference call is likely stuck.",
+                lock_timeout.as_secs()
+            );
+            anyhow::anyhow!(
+                "ONNX session lock timeout ({}s) in batch embed",
+                lock_timeout.as_secs()
+            )
+        })?;
 
         let batch_size = texts.len();
         let max_length = self.config.max_length;

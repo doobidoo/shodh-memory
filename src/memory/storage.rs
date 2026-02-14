@@ -998,13 +998,13 @@ impl MemoryStorage {
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 for fast reads
         opts.set_block_based_table_factory(&block_opts);
 
-        // Open main database
+        // Open main database (with auto-repair on corruption)
         let main_path = path.join("memories");
-        let db = Arc::new(DB::open(&opts, main_path)?);
+        let db = Arc::new(Self::open_or_repair(&opts, &main_path, "memories")?);
 
-        // Open index database
+        // Open index database (with auto-repair on corruption)
         let index_path = path.join("memory_index");
-        let index_db = Arc::new(DB::open(&opts, index_path)?);
+        let index_db = Arc::new(Self::open_or_repair(&opts, &index_path, "memory_index")?);
 
         let write_mode = WriteMode::default();
         tracing::info!(
@@ -1023,6 +1023,50 @@ impl MemoryStorage {
             storage_path: path.to_path_buf(),
             write_mode,
         })
+    }
+
+    /// Open a RocksDB database, automatically repairing if corruption is detected.
+    ///
+    /// On hard kills (ONNX deadlock, OOM, kill -9), RocksDB SST files can be left
+    /// in a partially written state. This attempts repair before giving up.
+    fn open_or_repair(opts: &Options, path: &Path, label: &str) -> Result<DB> {
+        match DB::open(opts, path) {
+            Ok(db) => Ok(db),
+            Err(open_err) => {
+                let err_str = open_err.to_string();
+                // Only attempt repair for corruption-related errors
+                if err_str.contains("Corruption")
+                    || err_str.contains("bad block")
+                    || err_str.contains("checksum mismatch")
+                    || err_str.contains("MANIFEST")
+                    || err_str.contains("CURRENT")
+                {
+                    tracing::warn!(
+                        db = label,
+                        error = %open_err,
+                        "RocksDB corruption detected, attempting repair"
+                    );
+                    if let Err(repair_err) = DB::repair(opts, path) {
+                        tracing::error!(
+                            db = label,
+                            error = %repair_err,
+                            "RocksDB repair failed"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Failed to open or repair {label} database: open={open_err}, repair={repair_err}"
+                        ));
+                    }
+                    tracing::info!(db = label, "RocksDB repair succeeded, reopening");
+                    DB::open(opts, path).map_err(|e| {
+                        anyhow::anyhow!("Failed to open {label} database after repair: {e}")
+                    })
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to open {label} database: {open_err}"
+                    ))
+                }
+            }
+        }
     }
 
     /// Get the base storage path
@@ -2053,7 +2097,7 @@ impl MemoryStorage {
                     continue;
                 }
                 if let Ok((memory, _)) = deserialize_memory(&value) {
-                    if !memory.compressed && memory.created_at < cutoff {
+                    if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                         memories.push(memory);
                     }
                 }
@@ -2063,10 +2107,12 @@ impl MemoryStorage {
         Ok(memories)
     }
 
-    /// Mark memories as forgotten (soft delete) with atomic batch write
-    pub fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+    /// Mark memories as forgotten (soft delete) with atomic batch write.
+    /// Returns the IDs of memories that were flagged, so callers can clean up
+    /// secondary indices (vector, BM25, graph).
+    pub fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<Vec<MemoryId>> {
         let mut batch = rocksdb::WriteBatch::default();
-        let mut count = 0;
+        let mut flagged_ids = Vec::new();
         let now = Utc::now().to_rfc3339();
 
         let iter = self.db.iterator(IteratorMode::Start);
@@ -2080,6 +2126,7 @@ impl MemoryStorage {
                         continue;
                     }
                     if memory.created_at < cutoff {
+                        flagged_ids.push(memory.id.clone());
                         memory
                             .experience
                             .metadata
@@ -2092,25 +2139,26 @@ impl MemoryStorage {
                         let updated_value =
                             bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
                         batch.put(&key, updated_value);
-                        count += 1;
                     }
                 }
             }
         }
 
-        if count > 0 {
+        if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
             self.db.write_opt(batch, &write_opts)?;
         }
 
-        Ok(count)
+        Ok(flagged_ids)
     }
 
-    /// Mark memories with low importance as forgotten with atomic batch write
-    pub fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<usize> {
+    /// Mark memories with low importance as forgotten with atomic batch write.
+    /// Returns the IDs of memories that were flagged, so callers can clean up
+    /// secondary indices (vector, BM25, graph).
+    pub fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<Vec<MemoryId>> {
         let mut batch = rocksdb::WriteBatch::default();
-        let mut count = 0;
+        let mut flagged_ids = Vec::new();
         let now = Utc::now().to_rfc3339();
 
         let iter = self.db.iterator(IteratorMode::Start);
@@ -2124,6 +2172,7 @@ impl MemoryStorage {
                         continue;
                     }
                     if memory.importance() < threshold {
+                        flagged_ids.push(memory.id.clone());
                         memory
                             .experience
                             .metadata
@@ -2136,19 +2185,18 @@ impl MemoryStorage {
                         let updated_value =
                             bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
                         batch.put(&key, updated_value);
-                        count += 1;
                     }
                 }
             }
         }
 
-        if count > 0 {
+        if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
             self.db.write_opt(batch, &write_opts)?;
         }
 
-        Ok(count)
+        Ok(flagged_ids)
     }
 
     /// Remove memories matching a pattern with durable writes
@@ -3006,6 +3054,157 @@ impl MemoryStorage {
 
         Ok(stats)
     }
+
+    // =========================================================================
+    // INTERFERENCE PERSISTENCE (SHO-106 RIF)
+    // =========================================================================
+    //
+    // Persists InterferenceDetector state to the main RocksDB database using
+    // key prefix "interference:{memory_id}" for per-memory records and
+    // "interference_meta:total" for the aggregate event counter.
+    //
+    // This ensures retrieval-induced forgetting history survives server restarts.
+    // =========================================================================
+
+    /// Persist interference records for a single memory
+    ///
+    /// Key format: `interference:{memory_id}` → JSON `Vec<InterferenceRecord>`
+    pub fn save_interference_records(
+        &self,
+        memory_id: &str,
+        records: &[super::replay::InterferenceRecord],
+    ) -> Result<()> {
+        let key = format!("interference:{memory_id}");
+        let value =
+            serde_json::to_vec(records).context("Failed to serialize interference records")?;
+
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
+        self.db
+            .put_opt(key.as_bytes(), &value, &write_opts)
+            .context("Failed to persist interference records")?;
+
+        Ok(())
+    }
+
+    /// Load all interference records from storage on startup
+    ///
+    /// Scans all `interference:` prefixed keys and deserializes records.
+    /// Returns `(history_map, total_event_count)` for bulk-loading into InterferenceDetector.
+    pub fn load_all_interference_records(
+        &self,
+    ) -> Result<(
+        HashMap<String, Vec<super::replay::InterferenceRecord>>,
+        usize,
+    )> {
+        let prefix = b"interference:";
+        let mut history: HashMap<String, Vec<super::replay::InterferenceRecord>> = HashMap::new();
+        let mut total_events: usize = 0;
+
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
+
+        for item in iter.log_errors() {
+            let (key, value) = item;
+            let key_str = String::from_utf8_lossy(&key);
+
+            if !key_str.starts_with("interference:") {
+                break;
+            }
+
+            if let Some(memory_id) = key_str.strip_prefix("interference:") {
+                match serde_json::from_slice::<Vec<super::replay::InterferenceRecord>>(&value) {
+                    Ok(records) => {
+                        total_events += records.len();
+                        history.insert(memory_id.to_string(), records);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            key = %key_str,
+                            error = %e,
+                            "Failed to deserialize interference records, skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Load persisted total count (may be higher than sum of records due to eviction)
+        let persisted_total = self
+            .db
+            .get(b"interference_meta:total")
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 8 {
+                    Some(u64::from_le_bytes(v[..8].try_into().unwrap()) as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(total_events);
+
+        Ok((history, persisted_total.max(total_events)))
+    }
+
+    /// Delete interference records for a single memory (called on forget/delete)
+    pub fn delete_interference_records(&self, memory_id: &str) -> Result<()> {
+        let key = format!("interference:{memory_id}");
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
+        self.db
+            .delete_opt(key.as_bytes(), &write_opts)
+            .context("Failed to delete interference records")?;
+        Ok(())
+    }
+
+    /// Persist the total interference event count
+    ///
+    /// Key: `interference_meta:total` → 8-byte little-endian u64
+    pub fn save_interference_event_count(&self, count: usize) -> Result<()> {
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
+        self.db
+            .put_opt(
+                b"interference_meta:total",
+                &(count as u64).to_le_bytes(),
+                &write_opts,
+            )
+            .context("Failed to persist interference event count")?;
+        Ok(())
+    }
+
+    /// Delete ALL interference records (GDPR forget_all)
+    ///
+    /// Batch-deletes all `interference:` and `interference_meta:` keys.
+    pub fn clear_all_interference_records(&self) -> Result<usize> {
+        let prefix = b"interference";
+        let mut batch = WriteBatch::default();
+        let mut count = 0;
+
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
+
+        for item in iter.log_errors() {
+            let (key, _) = item;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("interference") {
+                break;
+            }
+            batch.delete(&key);
+            count += 1;
+        }
+
+        if count > 0 {
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(self.write_mode == WriteMode::Sync);
+            self.db.write_opt(batch, &write_opts)?;
+        }
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -3035,7 +3234,10 @@ mod tests {
     #[test]
     fn test_crc32_empty() {
         let crc = crc32_simple(b"");
-        assert_ne!(crc, 0);
+        assert_eq!(
+            crc, 0,
+            "IEEE CRC32 of empty input is 0 (init 0xFFFFFFFF XOR final 0xFFFFFFFF)"
+        );
     }
 
     #[test]

@@ -50,6 +50,29 @@ pub fn validate_user_id(user_id: &str) -> Result<()> {
         return Err(anyhow!("user_id cannot start or end with a dot"));
     }
 
+    // Reject absolute paths — PathBuf::join with an absolute path ignores the base
+    if std::path::Path::new(user_id).is_absolute() {
+        return Err(anyhow!("user_id cannot be an absolute path"));
+    }
+
+    // Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    // These cause issues when used as directory names on Windows
+    {
+        let upper = user_id.to_uppercase();
+        // Strip any extension (e.g., "CON.txt" is still reserved on Windows)
+        let stem = upper.split('.').next().unwrap_or(&upper);
+        const DEVICE_NAMES: &[&str] = &[
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if DEVICE_NAMES.contains(&stem) {
+            return Err(anyhow!(
+                "user_id cannot be a Windows reserved device name: {}",
+                user_id
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -289,6 +312,33 @@ pub fn validate_relationship_strength(strength: f32) -> Result<()> {
     Ok(())
 }
 
+/// Validate a scoring weight (0.0 to 1.0 inclusive, must be finite)
+pub fn validate_weight(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(anyhow!("{name} must be between 0.0 and 1.0, got: {value}"));
+    }
+    Ok(())
+}
+
+/// Validate a reminder timestamp is not unreasonably far in the past or future
+pub fn validate_reminder_timestamp(at: &chrono::DateTime<chrono::Utc>) -> Result<()> {
+    let now = chrono::Utc::now();
+    let max_future = now + chrono::Duration::days(365 * 5); // 5 years
+    let max_past = now - chrono::Duration::hours(1); // Allow up to 1 hour in the past (clock skew)
+
+    if *at < max_past {
+        return Err(anyhow!("Reminder timestamp is in the past: {at}"));
+    }
+
+    if *at > max_future {
+        return Err(anyhow!(
+            "Reminder timestamp is too far in the future (max 5 years): {at}"
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +506,33 @@ mod tests {
         assert!(validate_relationship_strength(1.0).is_ok());
         assert!(validate_relationship_strength(-0.1).is_err());
         assert!(validate_relationship_strength(1.1).is_err());
+    }
+
+    #[test]
+    fn test_validate_weight() {
+        assert!(validate_weight("test", 0.0).is_ok());
+        assert!(validate_weight("test", 0.5).is_ok());
+        assert!(validate_weight("test", 1.0).is_ok());
+        assert!(validate_weight("test", -0.1).is_err());
+        assert!(validate_weight("test", 1.1).is_err());
+        assert!(validate_weight("test", f32::NAN).is_err());
+        assert!(validate_weight("test", f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_validate_reminder_timestamp() {
+        let now = chrono::Utc::now();
+
+        // Valid: 1 hour from now
+        assert!(validate_reminder_timestamp(&(now + chrono::Duration::hours(1))).is_ok());
+
+        // Valid: 30 minutes ago (within 1 hour tolerance)
+        assert!(validate_reminder_timestamp(&(now - chrono::Duration::minutes(30))).is_ok());
+
+        // Invalid: 2 hours ago
+        assert!(validate_reminder_timestamp(&(now - chrono::Duration::hours(2))).is_err());
+
+        // Invalid: 10 years from now
+        assert!(validate_reminder_timestamp(&(now + chrono::Duration::days(365 * 10))).is_err());
     }
 }

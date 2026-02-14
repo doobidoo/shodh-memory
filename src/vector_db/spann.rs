@@ -570,7 +570,8 @@ impl SpannIndex {
             .map(|(i, c)| (i, self.compute_distance(query, c)))
             .collect();
 
-        partition_distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        partition_distances
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let probe_partitions: Vec<usize> = partition_distances
             .iter()
             .take(self.config.num_probes)
@@ -581,11 +582,14 @@ impl SpannIndex {
         let quantizer = self.quantizer.read();
         let partitions = self.partitions.read();
 
-        // Build distance table for PQ (if enabled)
+        // Build distance table for PQ (required for SPANN search)
         let distance_table = if let Some(ref pq) = *quantizer {
             Some(pq.build_distance_table(query)?)
         } else {
-            None
+            anyhow::bail!(
+                "SPANN search requires PQ quantizer but use_pq is disabled. \
+                 PostingEntry stores only PQ codes, not original vectors."
+            );
         };
 
         // Collect candidates from all probed partitions
@@ -654,7 +658,7 @@ impl SpannIndex {
 
         // Convert heap to sorted results (smallest distance first)
         let mut results: Vec<(u32, f32)> = heap.into_iter().map(|(d, id)| (id, d.0)).collect();
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(results)
     }

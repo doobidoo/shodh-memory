@@ -7,8 +7,20 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::info;
+
+/// Static regex for extracting all-caps terms (API, TUI, NER, REST, etc.)
+fn allcaps_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b[A-Z]{2,}[A-Z0-9]*\b").unwrap())
+}
+
+/// Static regex for extracting issue IDs (SHO-XX, JIRA-123, etc.)
+fn issue_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap())
+}
 
 use crate::ab_testing;
 use crate::backup;
@@ -22,9 +34,10 @@ use crate::graph_memory::{
     LtpStatus, RelationType, RelationshipEdge,
 };
 use crate::memory::{
-    facts::SemanticFactStore, query_parser, Experience, FeedbackStore, FileMemoryStore,
-    MemoryConfig, MemoryId, MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
+    query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
+    MemorySystem, ProspectiveStore, SessionStore, TodoStore,
 };
+use crate::relevance::RelevanceEngine;
 use crate::streaming;
 
 use super::types::{AuditEvent, ContextStatus, MemoryEvent};
@@ -43,14 +56,19 @@ struct MultiUserMemoryManagerRotationHelper {
 impl MultiUserMemoryManagerRotationHelper {
     /// Rotate audit logs for a user - delete old entries and enforce max count.
     ///
-    /// Optimized: Keys are `{user_id}:{timestamp_nanos}` so RocksDB returns them
-    /// in timestamp-sorted order. No in-memory sort needed.
+    /// Keys are `{user_id}:{timestamp_nanos:020}` so RocksDB returns them in
+    /// ascending timestamp order. Two strategies depending on scale:
+    /// - ≤100K keys: collect all, compute excess, batch delete
+    /// - >100K keys: streaming 2-pass (count, then delete) to avoid OOM
     fn rotate_user_audit_logs(&self, user_id: &str) -> Result<usize> {
         let cutoff_time = chrono::Utc::now() - chrono::Duration::days(self.audit_retention_days);
-        let cutoff_nanos = cutoff_time.timestamp_nanos_opt().unwrap_or(0);
+        let cutoff_nanos = cutoff_time.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("audit cutoff timestamp outside i64 nanos range, using 0");
+            0
+        });
         let prefix = format!("{user_id}:");
 
-        // Pass 1: Count total entries (no deserialization, just key counting)
+        // Pass 1: count total entries to determine excess
         let mut total_count = 0usize;
         let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
         for (key, _) in iter.flatten() {
@@ -66,50 +84,50 @@ impl MultiUserMemoryManagerRotationHelper {
             return Ok(0);
         }
 
-        // Calculate how many excess entries to delete (beyond max_entries)
         let excess_count = total_count.saturating_sub(self.audit_max_entries);
 
-        // Pass 2: Collect keys to delete (oldest first due to key ordering)
-        // Delete entries that are: too old OR part of excess count
-        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+        // Pass 2: stream through keys, deleting those that are too old or excess.
+        // Flush WriteBatch every 10K deletes to bound memory.
+        const BATCH_FLUSH_SIZE: usize = 10_000;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut removed_count = 0usize;
         let mut position = 0usize;
 
         let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
         for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
+            let key_str = match std::str::from_utf8(&key) {
+                Ok(s) => s,
+                Err(_) => {
+                    position += 1;
+                    continue;
                 }
-
-                // Extract timestamp from key: "{user_id}:{timestamp_nanos}"
-                let should_delete = if let Some(ts_str) = key_str.strip_prefix(&prefix) {
-                    if let Ok(timestamp_nanos) = ts_str.parse::<i64>() {
-                        // Delete if: older than cutoff OR in the excess oldest entries
-                        timestamp_nanos < cutoff_nanos || position < excess_count
-                    } else {
-                        // Malformed key - delete it
-                        true
-                    }
-                } else {
-                    false
-                };
-
-                if should_delete {
-                    keys_to_remove.push(key.to_vec());
-                }
-
-                position += 1;
+            };
+            if !key_str.starts_with(&prefix) {
+                break;
             }
+
+            let ts = key_str
+                .strip_prefix(&prefix)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0); // Malformed keys sort first → get deleted
+
+            if ts < cutoff_nanos || position < excess_count {
+                batch.delete(&key);
+                removed_count += 1;
+
+                if removed_count % BATCH_FLUSH_SIZE == 0 {
+                    self.audit_db
+                        .write(std::mem::take(&mut batch))
+                        .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
+                    batch = rocksdb::WriteBatch::default();
+                }
+            }
+
+            position += 1;
         }
 
-        let removed_count = keys_to_remove.len();
-
-        // Batch delete
-        if !keys_to_remove.is_empty() {
-            let mut batch = rocksdb::WriteBatch::default();
-            for key in &keys_to_remove {
-                batch.delete(key);
-            }
+        // Flush remaining
+        if removed_count % BATCH_FLUSH_SIZE != 0 {
             self.audit_db
                 .write(batch)
                 .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
@@ -200,11 +218,11 @@ pub struct MultiUserMemoryManager {
     /// A/B testing manager for relevance scoring experiments
     pub ab_test_manager: Arc<ab_testing::ABTestManager>,
 
-    /// Semantic fact store for durable knowledge
-    pub fact_store: Arc<SemanticFactStore>,
-
     /// Session tracking store
     pub session_store: Arc<SessionStore>,
+
+    /// Shared relevance engine for proactive memory surfacing (entity cache + learned weights persist)
+    pub relevance_engine: Arc<RelevanceEngine>,
 }
 
 impl MultiUserMemoryManager {
@@ -332,6 +350,9 @@ impl MultiUserMemoryManager {
         info!("Prospective memory store initialized");
 
         let todo_store = Arc::new(TodoStore::new(&base_path)?);
+        if let Err(e) = todo_store.load_vector_indices() {
+            tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
+        }
         info!("Todo store initialized");
 
         let file_store = Arc::new(FileMemoryStore::new(&base_path)?);
@@ -354,6 +375,9 @@ impl MultiUserMemoryManager {
         let keyword_extractor = Arc::new(KeywordExtractor::new());
         info!("Keyword extractor initialized (YAKE)");
 
+        let relevance_engine = Arc::new(RelevanceEngine::new(neural_ner.clone()));
+        info!("Relevance engine initialized (entity cache + learned weights)");
+
         let backup_path = base_path.join("backups");
         let backup_engine = Arc::new(backup::ShodhBackupEngine::new(backup_path)?);
         if server_config.backup_enabled {
@@ -365,14 +389,6 @@ impl MultiUserMemoryManager {
         } else {
             info!("Backup engine initialized (auto-backup disabled)");
         }
-
-        let facts_path = base_path.join("semantic_facts");
-        let mut facts_opts = rocksdb::Options::default();
-        facts_opts.create_if_missing(true);
-        facts_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let facts_db = Arc::new(rocksdb::DB::open(&facts_opts, &facts_path)?);
-        let fact_store = Arc::new(SemanticFactStore::new(facts_db));
-        info!("Semantic fact store initialized");
 
         let manager = Self {
             user_memories,
@@ -399,8 +415,8 @@ impl MultiUserMemoryManager {
                 tx
             },
             ab_test_manager: Arc::new(ab_testing::ABTestManager::new()),
-            fact_store,
             session_store: Arc::new(SessionStore::new()),
+            relevance_engine,
         };
 
         info!("Running initial audit log rotation...");
@@ -421,9 +437,12 @@ impl MultiUserMemoryManager {
         };
 
         let key = format!(
-            "{}:{}",
+            "{}:{:020}",
             user_id,
-            event.timestamp.timestamp_nanos_opt().unwrap_or(0)
+            event.timestamp.timestamp_nanos_opt().unwrap_or_else(|| {
+                tracing::warn!("audit event timestamp outside i64 nanos range, using 0");
+                0
+            })
         );
         if let Ok(serialized) = bincode::serde::encode_to_vec(&event, bincode::config::standard()) {
             let db = self.audit_db.clone();
@@ -437,17 +456,17 @@ impl MultiUserMemoryManager {
         }
 
         let max_entries = self.server_config.audit_max_entries_per_user;
-        if let Some(log) = self.audit_logs.get(user_id) {
+        let log = self
+            .audit_logs
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::RwLock::new(VecDeque::new())))
+            .clone();
+        {
             let mut entries = log.write();
             entries.push_back(event);
             while entries.len() > max_entries {
                 entries.pop_front();
             }
-        } else {
-            let mut deque = VecDeque::new();
-            deque.push_back(event);
-            let log = Arc::new(parking_lot::RwLock::new(deque));
-            self.audit_logs.insert(user_id.to_string(), log);
         }
 
         let count = self
@@ -523,8 +542,11 @@ impl MultiUserMemoryManager {
         }
 
         if !events.is_empty() {
-            let log = Arc::new(parking_lot::RwLock::new(VecDeque::from(events.clone())));
-            self.audit_logs.insert(user_id.to_string(), log);
+            self.audit_logs
+                .entry(user_id.to_string())
+                .or_insert_with(|| {
+                    Arc::new(parking_lot::RwLock::new(VecDeque::from(events.clone())))
+                });
         }
 
         if let Some(mid) = memory_id {
@@ -674,7 +696,7 @@ impl MultiUserMemoryManager {
                 }
             }
         }
-        events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        events.reverse();
         events.truncate(limit);
         events
     }
@@ -866,13 +888,17 @@ impl MultiUserMemoryManager {
         let user_count = user_ids.len();
         let mut edges_decayed = 0;
         let mut edges_strengthened = 0;
+        let mut total_facts_extracted = 0;
+        let mut total_facts_reinforced = 0;
 
         for user_id in user_ids {
             let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
-                match memory.run_maintenance(decay_factor) {
+                match memory.run_maintenance(decay_factor, &user_id) {
                     Ok(result) => {
                         total_processed += result.decayed_count;
+                        total_facts_extracted += result.facts_extracted;
+                        total_facts_reinforced += result.facts_reinforced;
                         Some(result)
                     }
                     Err(e) => {
@@ -918,10 +944,12 @@ impl MultiUserMemoryManager {
         }
 
         tracing::info!(
-            "Maintenance complete: {} memories processed, {} edges strengthened, {} weak edges pruned across {} users",
+            "Maintenance complete: {} memories processed, {} edges strengthened, {} weak edges pruned, {} facts extracted, {} facts reinforced across {} users",
             total_processed,
             edges_strengthened,
             edges_decayed,
+            total_facts_extracted,
+            total_facts_reinforced,
             user_count
         );
 
@@ -961,11 +989,6 @@ impl MultiUserMemoryManager {
     /// Get the feedback store
     pub fn feedback_store(&self) -> &Arc<parking_lot::RwLock<FeedbackStore>> {
         &self.feedback_store
-    }
-
-    /// Get the fact store
-    pub fn fact_store(&self) -> &Arc<SemanticFactStore> {
-        &self.fact_store
     }
 
     /// Get the session store
@@ -1021,11 +1044,6 @@ impl MultiUserMemoryManager {
 
         // ProspectiveStore (reminders) databases
         for (name, db) in self.prospective_store.databases() {
-            refs.push((name.to_string(), std::sync::Arc::clone(db)));
-        }
-
-        // SemanticFactStore database
-        for (name, db) in self.fact_store.databases() {
             refs.push((name.to_string(), std::sync::Arc::clone(db)));
         }
 
@@ -1297,8 +1315,7 @@ impl MultiUserMemoryManager {
             .collect();
 
         // Extract all-caps terms (API, TUI, NER, REST, etc.)
-        let allcaps_regex = regex::Regex::new(r"\b[A-Z]{2,}[A-Z0-9]*\b").unwrap();
-        let allcaps_entities: Vec<(String, EntityNode)> = allcaps_regex
+        let allcaps_entities: Vec<(String, EntityNode)> = allcaps_regex()
             .find_iter(&experience.content)
             .filter_map(|cap| {
                 let term = cap.as_str();
@@ -1332,8 +1349,7 @@ impl MultiUserMemoryManager {
             .collect();
 
         // Extract issue IDs (SHO-XX, JIRA-123, etc.)
-        let issue_regex = regex::Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap();
-        let issue_entities: Vec<(String, EntityNode)> = issue_regex
+        let issue_entities: Vec<(String, EntityNode)> = issue_regex()
             .find_iter(&experience.content)
             .filter_map(|issue| {
                 let issue_id = issue.as_str();
@@ -1407,14 +1423,22 @@ impl MultiUserMemoryManager {
             }
         }
 
-        // Combine all entity groups for insertion
-        let all_entities: Vec<(String, EntityNode)> = ner_entities
+        // Combine all entity groups for insertion, capped at 10 to prevent
+        // O(n²) edge explosion (10 entities → max 45 edges)
+        let mut all_entities: Vec<(String, EntityNode)> = ner_entities
             .into_iter()
             .chain(tag_entities)
             .chain(allcaps_entities)
             .chain(issue_entities)
             .chain(verb_entities)
             .collect();
+        all_entities.sort_by(|a, b| {
+            b.1.salience
+                .partial_cmp(&a.1.salience)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let entity_cap = self.server_config.max_entities_per_memory;
+        all_entities.truncate(entity_cap);
 
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
@@ -1469,6 +1493,8 @@ impl MultiUserMemoryManager {
         }
 
         // Create relationships between co-occurring entities
+        // Pre-compute truncated context once (avoids re-allocating per edge)
+        let truncated_context: String = experience.content.chars().take(150).collect();
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
                 let edge = RelationshipEdge {
@@ -1481,7 +1507,7 @@ impl MultiUserMemoryManager {
                     valid_at: now,
                     invalidated_at: None,
                     source_episode_id: Some(memory_id.0),
-                    context: experience.content.clone(),
+                    context: truncated_context.clone(),
                     last_activated: now,
                     activation_count: 1,
                     ltp_status: LtpStatus::None,

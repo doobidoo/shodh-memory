@@ -71,6 +71,20 @@ pub const EDGE_INITIAL_STRENGTH: f32 = 0.5;
 /// - Matches IMPORTANCE_FLOOR for consistency
 pub const EDGE_MIN_STRENGTH: f32 = 0.05;
 
+/// Maximum number of edges per entity (insert-time degree cap)
+///
+/// When an entity exceeds this many edges after a new insertion,
+/// the weakest edges (by effective_strength) are pruned to stay at cap.
+///
+/// Justification:
+/// - Prevents O(n²) edge explosion: 100 entities × 100 = 10,000 edges max
+/// - 500 edges per entity is generous for meaningful relationships
+/// - Beyond 500, diminishing returns — weak edges add noise, not signal
+/// - Matches neuroscience: synaptic pruning removes weak connections
+///
+/// Reference: Chechik et al. (1998) "Synaptic Pruning in Development"
+pub const MAX_ENTITY_DEGREE: usize = 500;
+
 /// Edge half-life base in hours (for time-based decay)
 ///
 /// Associations decay exponentially with this half-life.
@@ -81,6 +95,54 @@ pub const EDGE_MIN_STRENGTH: f32 = 0.05;
 /// - Strong edges (0.9 strength) decay much slower: ~96 hours effective half-life
 /// - Matches circadian rhythms in memory consolidation
 pub const EDGE_HALF_LIFE_HOURS: f64 = 24.0;
+
+// =============================================================================
+// GRAPH QUALITY: CONCEPT MERGING, SEMANTIC EDGES, DEGREE NORMALIZATION
+// =============================================================================
+
+/// Cosine similarity threshold for merging entity nodes as the same concept.
+///
+/// When string-based dedup (exact/case/stemmed) fails to find a match,
+/// entities with name embeddings above this threshold are treated as synonyms
+/// and merged into a single graph node.
+///
+/// Justification:
+/// - 0.85 is conservative — avoids false merges ("Rust language" vs "Rust game")
+/// - Catches abbreviations and synonyms ("authentication" ↔ "auth" ↔ "auth system")
+/// - Based on typical cosine similarity distributions for MiniLM-L6-v2:
+///   synonyms cluster 0.82–0.95, unrelated pairs fall below 0.60
+///
+/// Reference: Reimers & Gurevych (2019) "Sentence-BERT"
+pub const ENTITY_CONCEPT_MERGE_THRESHOLD: f32 = 0.85;
+
+/// Floor multiplier for semantic edge weighting.
+///
+/// Initial edge weight = L1_INITIAL_WEIGHT × (floor + (1 − floor) × cosine_sim).
+///
+/// Justification:
+/// - At floor=0.2: unrelated co-occurring entities get weight 0.06 (decays fast)
+///   while semantically related pairs get up to 0.30 (full L1 weight)
+/// - Prevents noisy edges from polluting the graph without blocking them entirely
+/// - Floor > 0 ensures even unrelated pairs can strengthen through repeated
+///   coactivation (Hebbian learning overrides initial weakness)
+///
+/// Reference: Lund & Burgess (1996) "Producing high-dimensional semantic spaces"
+pub const EDGE_SEMANTIC_WEIGHT_FLOOR: f32 = 0.2;
+
+/// Whether to apply degree normalization during spreading activation.
+///
+/// When true, outgoing activation per edge is divided by sqrt(1 + degree).
+/// Effect: node with 1 edge → factor 0.71, 10 edges → 0.30,
+/// 100 edges → 0.099, 500 edges → 0.045.
+///
+/// Justification:
+/// - Without normalization, hub nodes (500+ edges) propagate identical per-edge
+///   activation as leaf nodes (2 edges), drowning out precise signals
+/// - sqrt(1+k) matches the fan effect in ACT-R spreading activation
+/// - Can be disabled as an escape hatch without code changes
+///
+/// Reference: Anderson & Reder (1999) "The fan effect: New results and new theories"
+pub const SPREADING_DEGREE_NORMALIZATION: bool = true;
 
 // =============================================================================
 // COMPRESSION THRESHOLDS
@@ -371,6 +433,23 @@ pub const CONSOLIDATION_MIN_SUPPORT: usize = 2;
 /// - Matches weekly work cycles
 pub const CONSOLIDATION_MIN_AGE_DAYS: i64 = 7;
 
+/// Jaccard similarity threshold for grouping consolidation patterns
+///
+/// Justification:
+/// - Stemmed-token Jaccard collapses inflections ("deployed"/"deploying" → "deploy")
+/// - 0.45 allows semantically similar but differently worded patterns to cluster
+/// - Lower than FactStore dedup (0.7) because we want broader grouping at extraction
+/// - Below 0.3 would create overly broad clusters mixing unrelated topics
+pub const CONSOLIDATION_JACCARD_THRESHOLD: f32 = 0.45;
+
+/// Maximum fact candidates extracted per memory during consolidation
+///
+/// Justification:
+/// - Multi-extractor pipeline runs all extractors on every memory
+/// - 5 is generous: procedure + definition + pattern + preference + salient
+/// - Prevents one verbose memory from dominating the candidate pool
+pub const CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY: usize = 5;
+
 /// Base decay period for semantic facts (days)
 ///
 /// Unreinforced facts start decaying after this period.
@@ -386,6 +465,63 @@ pub const FACT_DECAY_BASE_DAYS: i64 = 30;
 /// - 7 days per supporting memory
 /// - Fact with 5 supporters: 30 + 35 = 65 days before decay
 pub const FACT_DECAY_PER_SUPPORT_DAYS: i64 = 7;
+
+/// Cosine similarity threshold for hybrid fact deduplication
+///
+/// Justification:
+/// - MiniLM-L6-v2 cosine > 0.80 indicates near-paraphrase for short factual statements
+/// - Below 0.80 risks merging topically related but semantically distinct facts
+/// - Combined with entity + polarity gates for high precision
+/// Reference: Reimers & Gurevych 2019 (Sentence-BERT)
+pub const FACT_DEDUP_COSINE_THRESHOLD: f32 = 0.80;
+
+/// Jaccard sanity floor for hybrid fact deduplication
+///
+/// Justification:
+/// - Even with high cosine, facts with zero lexical overlap are suspicious
+/// - 0.30 ensures at least ~30% word overlap as a cross-check
+/// - Prevents pure embedding hallucination from causing false merges
+pub const FACT_DEDUP_JACCARD_FLOOR: f32 = 0.30;
+
+/// Legacy Jaccard-only threshold (fallback when embedder is unavailable)
+///
+/// Justification:
+/// - Original threshold for pure Jaccard dedup (preserved for graceful degradation)
+/// - Used when embedder fails (circuit breaker open, model load failure)
+/// - Also used per-candidate when an existing fact has no stored embedding
+pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.70;
+
+/// Negation markers for polarity detection in fact deduplication
+///
+/// Justification:
+/// - "X uses JWT" vs "X does not use JWT" have high cosine but opposite meaning
+/// - Scanning for negation markers catches the most common contradictions
+/// - Double-negation handling: even count of markers = positive polarity
+pub const FACT_NEGATION_MARKERS: &[&str] = &[
+    "not",
+    "n't",
+    "never",
+    "no",
+    "none",
+    "neither",
+    "nor",
+    "cannot",
+    "can't",
+    "won't",
+    "don't",
+    "doesn't",
+    "didn't",
+    "shouldn't",
+    "wouldn't",
+    "couldn't",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "weren't",
+    "hasn't",
+    "haven't",
+    "hadn't",
+];
 
 // =============================================================================
 // DEFAULT CONFIGURATION VALUES
@@ -1635,8 +1771,14 @@ pub const TIER_LTP_THRESHOLD: f32 = 0.8;
 // |-------------------------------|---------------------- |-----------------------------------|
 // | CONSOLIDATION_MIN_SUPPORT     | memory/compression.rs | consolidate_semantic_facts()      |
 // | CONSOLIDATION_MIN_AGE_DAYS    | memory/compression.rs | consolidate_semantic_facts()      |
+// | CONSOLIDATION_JACCARD_THRESHOLD | memory/compression.rs | group_candidates_by_similarity()  |
+// | CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY | memory/compression.rs | extract_fact_candidates() |
 // | FACT_DECAY_BASE_DAYS          | memory/compression.rs | fact decay calculation            |
 // | FACT_DECAY_PER_SUPPORT_DAYS   | memory/compression.rs | fact decay per support            |
+// | FACT_DEDUP_COSINE_THRESHOLD   | memory/facts.rs       | find_similar() hybrid dedup       |
+// | FACT_DEDUP_JACCARD_FLOOR      | memory/facts.rs       | find_similar() hybrid dedup       |
+// | FACT_DEDUP_JACCARD_FALLBACK   | memory/facts.rs       | find_similar() fallback mode      |
+// | FACT_NEGATION_MARKERS         | memory/facts.rs       | detect_polarity()                 |
 //
 // ## Default Configuration Constants
 // | Constant                      | File                | Function/Context                    |
